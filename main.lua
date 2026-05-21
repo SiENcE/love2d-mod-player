@@ -222,6 +222,12 @@ local channels = {}
 local sampleSources = {}
 local play = false
 
+-- When true: track sample-frame position per channel each tick and seek with the
+-- pitch-corrected formula.  Eliminates loop drift at all pitches.
+-- Set to false for LoveDOS / low-CPU targets, which fall back to the coarser
+-- tell()-based poll (drifts at pitches ≠ C-2 but costs almost nothing).
+local USE_SOFTWARE_LOOP = true
+
 -- Protracker sine table (32 entries, one half-wave 0..255)
 local SINE_TABLE = {
     0,  24,  49,  74,  97, 120, 141, 161,
@@ -470,9 +476,12 @@ local function initializeChannels()
             delayNote = nil,
             delayTick = 0,
             -- Loop state (set from sampleSources when a sample is triggered)
-            hasLoop   = false,
-            loopStart = 0,
-            loopEnd   = 0,
+            hasLoop        = false,
+            loopStart      = 0,   -- seconds  (LoveDOS fallback)
+            loopEnd        = 0,   -- seconds  (LoveDOS fallback)
+            loopStartFrame = 0,   -- raw sample frames
+            loopEndFrame   = 0,   -- raw sample frames
+            sampleFramePos = 0,   -- running frame counter for software-loop tracking
             -- Current row's note (used by doEffects on in-between ticks)
             currentNote = nil,
         }
@@ -560,13 +569,16 @@ local function loadSamples()
             local src = love.audio.newSource(tempFile, "static")
 
             -- MOD loop convention: loopLength > 2 bytes means the sample loops.
-            -- Store loop boundaries in seconds for software loop polling.
+            -- Store loop boundaries both in seconds (LoveDOS fallback) and in raw
+            -- sample frames (accurate software-loop path).
             local hasLoop = sample.loopLength > 2
             sampleSources[i] = {
-                source    = src,
-                hasLoop   = hasLoop,
-                loopStart = sample.loopStart / 8363,                           -- seconds
-                loopEnd   = (sample.loopStart + sample.loopLength) / 8363,     -- seconds
+                source         = src,
+                hasLoop        = hasLoop,
+                loopStart      = sample.loopStart / 8363,                       -- seconds (LoveDOS fallback)
+                loopEnd        = (sample.loopStart + sample.loopLength) / 8363, -- seconds (LoveDOS fallback)
+                loopStartFrame = sample.loopStart,                              -- raw sample frames
+                loopEndFrame   = sample.loopStart + sample.loopLength,          -- raw sample frames
             }
 			--print(sampleSources[i].hasLoop,sampleSources[i].loopStart,sampleSources[i].loopEnd)
 
@@ -716,10 +728,15 @@ local function triggerSample(channel, note, seekBytes)
         ch.source = baseSrc
     end
 
-    -- Store loop boundaries (in seconds) for software loop polling in processMOD
-    ch.hasLoop   = sampleEntry.hasLoop
-    ch.loopStart = sampleEntry.loopStart
-    ch.loopEnd   = sampleEntry.loopEnd
+    -- Store loop boundaries for both the accurate (frame) and fallback (seconds) paths.
+    ch.hasLoop        = sampleEntry.hasLoop
+    ch.loopStart      = sampleEntry.loopStart
+    ch.loopEnd        = sampleEntry.loopEnd
+    ch.loopStartFrame = sampleEntry.loopStartFrame
+    ch.loopEndFrame   = sampleEntry.loopEndFrame
+    -- Reset the frame counter; seekBytes offset is applied below via source:seek()
+    -- so the counter starts there too.
+    ch.sampleFramePos = seekBytes
 
     -- Apply current channel volume
     ch.source:setVolume(ch.volume / 64)
@@ -1124,19 +1141,49 @@ local function processMOD(dt)
             -- In-between ticks: run tick-based effects
             doEffects()
         end
+
+        -- ── Accurate software-loop: advance per-channel frame counters ────────
+        -- Each tick has an exact duration of 5/(2*bpm) seconds.  Multiplying by
+        -- the pitch factor (428/period) and the base sample rate (8363 Hz) gives
+        -- the exact number of source frames consumed this tick, independent of
+        -- any pitch drift from vibrato or arpeggio (those oscillate around the
+        -- base period so the error averages to zero over a cycle).
+        --
+        -- seek() formula: tell()/seek() on this LÖVE build operate in wall-clock
+        -- (real) seconds, i.e.  position = frames / (pitch × 8363).  If your
+        -- build uses source-data seconds instead, replace the seek call with:
+        --   ch.source:seek(ch.sampleFramePos / 8363, "seconds")
+        if USE_SOFTWARE_LOOP then
+            local secondsPerTick = 5 / (2 * bpm)
+            for ci = 1, mod.numChannels do
+                local ch = channels[ci]
+                if ch.source and ch.hasLoop and ch.source:isPlaying() and ch.period > 0 then
+                    local pitch   = 428 / ch.period
+                    local loopLen = ch.loopEndFrame - ch.loopStartFrame
+                    ch.sampleFramePos = ch.sampleFramePos + secondsPerTick * pitch * 8363
+                    if loopLen > 0 and ch.sampleFramePos >= ch.loopEndFrame then
+                        while ch.sampleFramePos >= ch.loopEndFrame do
+                            ch.sampleFramePos = ch.sampleFramePos - loopLen
+                        end
+                        ch.source:seek(ch.sampleFramePos / (pitch * 8363), "seconds")
+                    end
+                end
+            end
+        end
     end
 
-    -- Software loop enforcement: poll every frame and seek back when past loopEnd.
-    -- This runs regardless of tick timing so loops stay tight.
-    for channel = 1, mod.numChannels do
-        local ch = channels[channel]
-        if ch.source and ch.hasLoop and ch.source:isPlaying() then
-            local pos = ch.source:tell("seconds")
---print(pos,ch.loopEnd)
-            if pos >= ch.loopEnd then
-                -- Seek back to loop start, preserving any overshoot for tight loops
-                local overshoot = pos - ch.loopEnd
-                ch.source:seek(ch.loopStart + overshoot, "seconds")
+    -- LoveDOS fallback: coarse tell()-based loop check.
+    -- Drifts at pitches other than C-2 (period 428) but costs almost nothing.
+    -- Only active when USE_SOFTWARE_LOOP = false.
+    if not USE_SOFTWARE_LOOP then
+        for channel = 1, mod.numChannels do
+            local ch = channels[channel]
+            if ch.source and ch.hasLoop and ch.source:isPlaying() then
+                local pos = ch.source:tell("seconds")
+                if pos >= ch.loopEnd then
+                    local overshoot = pos - ch.loopEnd
+                    ch.source:seek(ch.loopStart + overshoot, "seconds")
+                end
             end
         end
     end
