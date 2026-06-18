@@ -239,6 +239,7 @@ local SINE_TABLE = {
 -- Pattern-navigation state (set during updateRow, consumed at row boundary)
 local jumpToOrder  = nil   -- Bxy: jump to this order index (0-based)
 local breakToRow   = nil   -- Dxy: break to this row in next order (0-based)
+local loopToRow    = nil   -- E6x: jump back to this row in the SAME pattern (1-based)
 local patDelay     = 0     -- EEx: how many extra "row holds" remain
 local loopRow      = {}    -- E6x per channel: stored loop-start row (1-based)
 local loopCount    = {}    -- E6x per channel: remaining loop iterations
@@ -381,11 +382,9 @@ local function loadMOD(filename)
         numChannels = 6
     elseif magicBytes == "8CHN" then
         numChannels = 8
-    elseif string.sub(magicBytes, 1, 2) == "CH" or
-           string.sub(magicBytes, 3, 4) == "CH" then
-        -- e.g. "10CH", "12CH" … "32CH"
+    elseif string.sub(magicBytes, 3, 4) == "CH" then
+        -- e.g. "10CH", "12CH" … "32CH": the channel count is the first 2 chars.
         local n = tonumber(string.sub(magicBytes, 1, 2))
-               or tonumber(string.sub(magicBytes, 1, 1))
         numChannels = n or 4
     else
         -- ── Old 15-sample "M15" format ──────────────────────────────────────
@@ -411,6 +410,12 @@ local function loadMOD(filename)
     -- Clamp song length to valid range
     if mod.songLength == 0 or mod.songLength > 128 then
         mod.songLength = 128
+    end
+
+    -- Restart position: 0-based order index the song loops back to at the end.
+    -- Values >= songLength (commonly 127 / 0x7F) mean "no restart" → loop to 0.
+    if mod.restartPosition >= mod.songLength then
+        mod.restartPosition = 0
     end
 
     -- Read pattern order table (128 bytes follow song-length byte)
@@ -472,6 +477,8 @@ local function initializeChannels()
             -- Arpeggio (effect 0)
             arpX = 0,
             arpY = 0,
+            -- Sample offset memory (effect 9xx; 9x0 reuses last offset)
+            sampleOffset = 0,
             -- Delay note (EDx)
             delayNote = nil,
             delayTick = 0,
@@ -485,7 +492,7 @@ local function initializeChannels()
             -- Current row's note (used by doEffects on in-between ticks)
             currentNote = nil,
         }
-        loopRow[i]   = 0
+        loopRow[i]   = 1   -- default loop start = top of pattern (1-based)
         loopCount[i] = 0
     end
 end
@@ -717,6 +724,12 @@ local function triggerSample(channel, note, seekBytes)
     local sampleEntry = sampleSources[sampleNum]
     if not sampleEntry then return end
 
+    -- Clamp a sample-offset (effect 9xx) request to the sample's length.  A
+    -- value past the end seeks to the end (silence), matching ProTracker,
+    -- rather than wrongly restarting playback from the beginning.
+    local sLen = mod.samples[sampleNum].length or 0
+    if seekBytes > sLen then seekBytes = sLen end
+
     -- Stop previous source
     if ch.source then ch.source:stop() end
 
@@ -768,9 +781,8 @@ local function triggerSample(channel, note, seekBytes)
         ch.tremoloPos = 0; ch.tremoloNeg = 0
     end
 
-    -- Seek to sample offset if requested (effect 9)
-    -- Guard: offset must be within sample bounds (spec §5.10)
-    if seekBytes > 0 and seekBytes < sample.length then
+    -- Seek to sample offset if requested (effect 9); already clamped above.
+    if seekBytes > 0 then
         pcall(function() ch.source:seek(seekBytes / 8363) end)
     end
 
@@ -790,6 +802,18 @@ local function playNote(channel, note)
 
     -- Remember this row's note so doEffects can continue it on in-between ticks
     ch.currentNote = note
+
+    -- Clear any residual transient pitch/volume left by the previous row's
+    -- vibrato / tremolo / arpeggio.  ProTracker reloads the base period and
+    -- volume at the start of every row (tick 0); the oscillating effects then
+    -- re-apply their offset on ticks > 0.  Without this, a vibrato row followed
+    -- by a plain row stays detuned, and tremolo sticks at the wrong volume.
+    if ch.source then
+        if ch.period > 0 then
+            ch.source:setPitch(428 / math.max(54, math.min(1712, ch.period)))
+        end
+        ch.source:setVolume(ch.volume / 64)
+    end
 
     -- Porta-to-Note flag: don't restart the sample (effects 3 and 5)
     local isPorta = (effect == 0x3 or effect == 0x5)
@@ -814,7 +838,11 @@ local function playNote(channel, note)
     -- ── Trigger sample / set period ──
     if note.period > 0 and not isPorta and not isDelay then
         local seekBytes = 0
-        if effect == 0x9 then seekBytes = param * 0x100 end
+        if effect == 0x9 then
+            -- 9xx offset is in 256-byte units; 9x0 reuses the last offset.
+            if param ~= 0 then ch.sampleOffset = param * 0x100 end
+            seekBytes = ch.sampleOffset
+        end
         triggerSample(channel, note, seekBytes)
     elseif note.period > 0 and isDelay then
         -- Store for later playback at tick EDy
@@ -925,19 +953,20 @@ local function playNote(channel, note)
             end
 
         elseif sub == 0x6 then
-            -- E6x: Pattern Loop
+            -- E6x: Pattern Loop (per channel).  E60 marks the loop start row;
+            -- E6x (x>0) jumps back to it x times before continuing.  The jump
+            -- target is consumed at the row boundary in processMOD (loopToRow),
+            -- staying within the SAME pattern – no order advance.
             if val == 0 then
                 loopRow[channel] = currentRow     -- mark loop start
             else
                 if loopCount[channel] == 0 then
-                    loopCount[channel] = val      -- set loop count
+                    loopCount[channel] = val      -- begin: set iteration count
                 else
                     loopCount[channel] = loopCount[channel] - 1
                 end
                 if loopCount[channel] > 0 then
-                    -- jump back: set currentRow to (loopStart - 1) so the
-                    -- normal +1 increment at the end of the row lands on loopStart
-                    currentRow = math.max(0, (loopRow[channel] or 1) - 1)
+                    loopToRow = loopRow[channel] or 1
                 end
             end
 
@@ -1118,10 +1147,16 @@ local function processMOD(dt)
                     breakToRow          = nil
                 elseif breakToRow ~= nil then
                     currentPatternIndex = currentPatternIndex + 1
-                    if currentPatternIndex > mod.songLength then currentPatternIndex = 1 end
+                    if currentPatternIndex > mod.songLength then
+                        currentPatternIndex = mod.restartPosition + 1
+                    end
                     currentPattern = mod.patternTable[currentPatternIndex]
                     currentRow     = breakToRow + 1   -- 0-based → 1-based
                     breakToRow     = nil
+                elseif loopToRow ~= nil then
+                    -- E6x Pattern Loop: jump back within the current pattern
+                    currentRow = loopToRow
+                    loopToRow  = nil
                 else
                     -- Normal row advance
                     currentRow = currentRow + 1
@@ -1129,7 +1164,7 @@ local function processMOD(dt)
                         currentRow          = 1
                         currentPatternIndex = currentPatternIndex + 1
                         if currentPatternIndex > mod.songLength then
-                            currentPatternIndex = 1
+                            currentPatternIndex = mod.restartPosition + 1
                         end
                         currentPattern = mod.patternTable[currentPatternIndex]
                     end
@@ -1336,7 +1371,7 @@ end
 -- LÖVE-DOS callback functions
 function love.load()
 	--love.window.setMode(1024, 768, {resizable = true, vsync = true})
-    mod = loadMOD("MUSIC/space_debris.mod") -- Load your MOD file
+    mod = loadMOD("MUSIC/viraxor_-_10_tons.mod") -- Load your MOD file
     initializeChannels()
     loadSamples()
     -- Prime the player: set initial pattern and play row 1 immediately
