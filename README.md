@@ -1,3 +1,7 @@
+# MOD PLAYER by [SiENcE.github.io](https://SiENcE.github.io)
+
+![MOD Player](docs/Recording.gif)
+
 # love2d-mod-player
 A MOD player made in love2d (lua) without additional dependencies
 
@@ -9,7 +13,7 @@ love .                      # plays the last song, or DEFAULT_MOD (set at the to
 love . MUSIC/slope.mod      # play another file (LÖVE 11)
 ```
 
-Put your own MOD files in `MUSIC/`. That folder is not in git, because we have no rights to redistribute other people's modules. If no MOD is found (e.g. right after cloning), the player plays `demo.mod`. It's an original song made for this player: the samples were synthesised and the patterns written in code. So it's covered by this repository's MIT licence.
+Put your own MOD files in `MUSIC/`. That folder is not in git, because we have no rights to redistribute other people's modules. If no MOD is found (e.g. right after cloning), the player plays `demo.mod`. It's an original song made for this player: the samples were synthesised and the patterns written in code.
 
 ## Desktop: retro tracker UI
 
@@ -76,3 +80,8 @@ Both backends share the same player code (pattern logic and all effects). They o
 Not supported in either mode: E0x (Amiga filter), EFx (invert loop, which FMODDOC also skips), and 8A4 surround (played centred).
 
 LoveDOS temp files are named `s<N>.wav`, `s<N>l.wav` (loop part) and `s<N>o<xx>.wav` (9xx offset), all within DOS 8.3 limits.
+
+## Copyright and licenses
+
+**MOD PLAYER** by [SiENcE.github.io](https://SiENcE.github.io)
+Copyright (c) 2026 SiENcE. Released under the [MIT License](LICENSE).
