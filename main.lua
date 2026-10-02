@@ -1,105 +1,45 @@
--- Complete MOD Player Implementation for LÖVE-DOS
---local bit32 = require "bit32"
---local PERIOD_TABLE = require "periodtable"
+-- Complete MOD Player Implementation for LÖVE and LÖVE-DOS
+--
+-- One ProTracker player core (FMODDOC.TXT) drives one of two audio backends:
+--   * Mixer  (USE_SOFTWARE_LOOP = true)  – LÖVE 11+.  All channels are mixed in
+--     Lua and streamed through a single QueueableSource: sample-exact tick
+--     timing, exact sample loops (even tiny chip loops), 9xx offsets, retrigs.
+--   * Source (USE_SOFTWARE_LOOP = false) – LoveDOS compatibility layer.  LoveDOS
+--     can only load sounds from .wav files and its Sources have no seek(), so
+--     every sample (and each loop / 9xx offset part of it) is written to the
+--     save directory and played as its own Source.
 
--- Complete MOD Player Implementation for LÖVE-DOS
-local bit32 = {}
+-- ───────────────────────────────────────────────────────────────
+--  Configuration
+-- ───────────────────────────────────────────────────────────────
 
-local N = 32
-local P = 2^N
+-- true  = software mixer (needs love.audio.newQueueableSource, LÖVE 11+)
+-- false = LoveDOS Source backend (also used automatically when the mixer API
+--         is missing, so LoveDOS works even if this is set to true)
+local USE_SOFTWARE_LOOP = false
 
-function bit32.bnot(x)
-	x = x % P
-	return P - 1 - x
-end
+-- Song to start with (or pass a file: love . MUSIC/foo.mod).  MUSIC/ is not in
+-- git (no redistribution rights); without the file the demo song plays.
+local DEFAULT_MOD = "MUSIC/demo.mod"
+local DEMO_MOD    = "demo.mod"  -- our own song (MIT), shipped with the player
 
-function bit32.band(x, y)
-	-- Common usecases, they deserve to be optimized
-	if y == 0xff then return x % 0x100 end
-	if y == 0xffff then return x % 0x10000 end
-	if y == 0xffffffff then return x % 0x100000000 end
-	
-	x, y = x % P, y % P
-	local r = 0
-	local p = 1
-	for i = 1, N do
-		local a, b = x % 2, y % 2
-		x, y = math.floor(x / 2), math.floor(y / 2)
-		if a + b == 2 then
-			r = r + p
-		end
-		p = 2 * p
-	end
-	return r
-end
+local MIX_RATE        = 44100  -- mixer output rate (Hz)
+local MIX_BUFFER      = 1024   -- frames per queued buffer (~23 ms)
+local MIX_BUFFERS     = 4      -- buffers kept queued (latency ~ MIX_BUFFERS * MIX_BUFFER)
+local MIX_INTERPOLATE = false  -- true = linear interpolation (smoother); false = raw like Paula
 
-function bit32.bor(x, y)
-	-- Common usecases, they deserve to be optimized
-	if y == 0xff then return x - (x%0x100) + 0xff end
-	if y == 0xffff then return x - (x%0x10000) + 0xffff end
-	if y == 0xffffffff then return 0xffffffff end
-	
-	x, y = x % P, y % P
-	local r = 0
-	local p = 1
-	for i = 1, N do
-		local a, b = x % 2, y % 2
-		x, y = math.floor(x / 2), math.floor(y / 2)
-		if a + b >= 1 then
-			r = r + p
-		end
-		p = 2 * p
-	end
-	return r
-end
+-- NTSC Amiga clock (FMODDOC §3.5): period 428 (C-2) plays at 8363 Hz
+local AMIGA_CLOCK = 7159090.5 / 2
 
-function bit32.bxor(x, y)
-	x, y = x % P, y % P
-	local r = 0
-	local p = 1
-	for i = 1, N do
-		local a, b = x%2, y%2
-		x, y = math.floor(x/2), math.floor(y/2)
-		if a + b == 1 then
-			r = r + p
-		end
-		p = 2 * p
-	end
-	return r
-end
+-- LoveDOS has no love.window (and never reads conf.lua).  It keeps the plain
+-- text screen; desktop LÖVE gets the retro UI in ui.lua.
+local IS_LOVEDOS = love.window == nil
 
-function bit32.lshift(x, s_amount)
-	if math.abs(s_amount) >= N then return 0 end
-	x = x % P
-	if s_amount < 0 then
-		return math.floor(x * (2 ^ s_amount))
-	else
-		return (x * (2 ^ s_amount)) % P
-	end
-end
+local interpolate = MIX_INTERPOLATE  -- runtime copy, toggled with I in the UI
 
-function bit32.rshift(x, s_amount)
-	if math.abs(s_amount) >= N then return 0 end
-	x = x % P
-	if s_amount > 0 then
-		return math.floor(x * (2 ^ - s_amount))
-	else
-		return (x * (2 ^ -s_amount)) % P
-	end
-end
-
-function bit32.arshift(x, s_amount)
-	if math.abs(s_amount) >= N then return 0 end
-	x = x % P
-	if s_amount > 0 then
-		local add = 0
-		if x >= P/2 then
-			add = P - 2 ^ (N - s_amount)
-		end
-		return math.floor(x * (2 ^ -s_amount)) + add
-	else
-		return (x * (2 ^ -s_amount)) % P
-	end
+if USE_SOFTWARE_LOOP and not (love.audio.newQueueableSource and love.sound and love.sound.newSoundData) then
+    print("Info: no QueueableSource support – using the LoveDOS Source backend.")
+    USE_SOFTWARE_LOOP = false
 end
 
 -- Period to pitch conversion table
@@ -215,18 +155,12 @@ local currentRow = 1
 local currentTick = 0
 local ticksPerRow = 6  -- Default speed (ticks per row)
 local bpm = 125        -- Default BPM (125 BPM = 50 ticks/sec)
-local tickAccum = 0    -- Accumulates real time; fires one tick when >= 1/tickRate
-local sampleRate = 44100
-local bufferSize = 4096 -- Adjust based on LÖVE-DOS requirements
+local songStarted = false -- false until the first row has been played
+local songEnded   = false -- set by F00 (ProTracker: stop the song)
+local songTime    = 0     -- seconds of song played (sum of tick lengths)
 local channels = {}
-local sampleSources = {}
 local play = false
-
--- When true: track sample-frame position per channel each tick and seek with the
--- pitch-corrected formula.  Eliminates loop drift at all pitches.
--- Set to false for LoveDOS / low-CPU targets, which fall back to the coarser
--- tell()-based poll (drifts at pitches ≠ C-2 but costs almost nothing).
-local USE_SOFTWARE_LOOP = true
+local backend          -- Mixer or Source (see bottom of file), chosen in love.load
 
 -- Protracker sine table (32 entries, one half-wave 0..255)
 local SINE_TABLE = {
@@ -249,16 +183,31 @@ local loopCount    = {}    -- E6x per channel: remaining loop iterations
 -- Value range: -1.0 (full left) to +1.0 (full right).
 local AMIGA_PAN = { -1.0, 1.0, 1.0, -1.0 }
 
--- Helper: apply a pan value (-1..+1) to a LÖVE source.
--- Uses source:setPosition(x, 0, 0) with distance model disabled so volume doesn't attenuate.
--- Wrapped in pcall so it silently degrades on LoveDOS where 3D audio may be absent.
-local function applyPan(source, pan)
-    if not source then return end
-    pcall(function()
-        love.audio.setDistanceModel("none")
-        source:setPosition(pan, 0, 0)
-        source:setRelative(true)
-    end)
+local EMPTY_NOTE = { sample = 0, period = 0, effect = 0, effectParam = 0 }
+
+-- Nibble helpers.  Plain arithmetic: an emulated bit32 costs a 32-step loop per
+-- call, which adds up on LoveDOS where these run every row and tick.
+local function hiNibble(b) return math.floor(b / 16) end
+local function loNibble(b) return b % 16 end
+
+-- Finetune (-8..7) → row in PERIOD_TABLE (0..7 → 1..8, -8..-1 → 9..16)
+local function ftIndex(finetune)
+    return (finetune >= 0) and (finetune + 1) or (finetune + 17)
+end
+
+-- Index (1-60) of the note in PERIOD_TABLE[ftIdx] closest to period
+local function nearestNote(ftIdx, period)
+    local row = PERIOD_TABLE[ftIdx]
+    local best, bestDiff = 1, math.huge
+    for i = 1, 60 do
+        local d = math.abs(row[i] - period)
+        if d < bestDiff then bestDiff = d; best = i end
+    end
+    return best
+end
+
+local function clampPeriod(period)
+    return math.max(54, math.min(1712, math.floor(period)))
 end
 
 -- MOD File Loader and Parser for LÖVE-DOS
@@ -266,19 +215,9 @@ local function readString(data, offset, length)
     return string.sub(data, offset, offset + length - 1)
 end
 
-local function readUint16(data, offset)
-    local b1, b2 = string.byte(data, offset, offset + 1)
-    return b1 * 256 + b2
-end
 local function readUint16BigEndian(data, offset)
-    -- Extract the two bytes starting from the offset
-    local byte1 = string.byte(data, offset)     -- Most significant byte (MSB)
-    local byte2 = string.byte(data, offset + 1) -- Least significant byte (LSB)
-
-    -- Combine them into a 16-bit unsigned integer (big-endian)
-    local value = byte1 * 256 + byte2
-
-    return value
+    local byte1, byte2 = string.byte(data, offset, offset + 1)
+    return byte1 * 256 + byte2
 end
 
 local function readUint8(data, offset)
@@ -289,8 +228,7 @@ local function parseSample(fileData, offset)
     local sample = {}
     sample.name = readString(fileData, offset, 22)  -- Read sample name (22 bytes)
     sample.length = readUint16BigEndian(fileData, offset + 22) * 2 -- Read sample length (2 bytes) and convert to bytes
-    local ft = readUint8(fileData, offset + 24)
-    ft = bit32.band(ft, 0x0F) -- lower 4 bits only
+    local ft = loNibble(readUint8(fileData, offset + 24)) -- lower 4 bits only
     if ft > 7 then ft = ft - 16 end -- signed: 8..15 -> -8..-1
     sample.finetune = ft -- Finetune value
     sample.volume = math.min(readUint8(fileData, offset + 25), 64) -- Volume, clamped to 0-64
@@ -306,21 +244,18 @@ local function parsePatterns(data, offset, numPatterns, numChannels)
         for row = 1, 64 do
             local rowData = {}
             for channel = 1, numChannels do
-                local noteData = {}
-                local byte1 = readUint8(data, offset)
-                local byte2 = readUint8(data, offset + 1)
-                local byte3 = readUint8(data, offset + 2)
-                local byte4 = readUint8(data, offset + 3)
-
-				if byte1 == nil then break end
-
-                -- Updated bitwise operations
-                noteData.sample = bit32.bor(bit32.band(byte1, 0xF0), bit32.rshift(byte3, 4))
-                noteData.period = bit32.bor(bit32.lshift(bit32.band(byte1, 0x0F), 8), byte2)
-                noteData.effect = bit32.band(byte3, 0x0F)
-                noteData.effectParam = byte4
-
-                rowData[channel] = noteData
+                local byte1, byte2, byte3, byte4 = string.byte(data, offset, offset + 3)
+                if byte4 then
+                    -- FMODDOC §2.6: aaaaBBBB CCCCCCCC DDDDeeee FFFFFFFF
+                    rowData[channel] = {
+                        sample      = (byte1 - byte1 % 16) + hiNibble(byte3),
+                        period      = (byte1 % 16) * 256 + byte2,
+                        effect      = byte3 % 16,
+                        effectParam = byte4,
+                    }
+                else
+                    rowData[channel] = EMPTY_NOTE  -- truncated file
+                end
                 offset = offset + 4
             end
             pattern[row] = rowData
@@ -349,14 +284,11 @@ For a typical "M.K." MOD file, the structure is as follows:
 	* Start with the header size: 1084 bytes
 	* Add the size of all patterns: (number of patterns * 1024 bytes)
 ]]--
-local function loadMOD(filename)
-    local fileData = love.filesystem.read(filename)
-    if not fileData then
-        error("Failed to load MOD file: " .. filename)
-    end
-    
+local function parseMOD(fileData)
+    if #fileData < 600 then error("Not a MOD file (too short)") end
+
     local mod = {}
-    
+
     -- Parse header
     mod.name = readString(fileData, 1, 20)
 
@@ -374,18 +306,20 @@ local function loadMOD(filename)
     local songLenOff  = 951   -- offset of "song length" byte (31-sample format)
     local patternBase = 1085  -- offset where pattern data begins (31-sample format)
 
-    if magicBytes == "M.K." or magicBytes == "M!K!" or magicBytes == "FLT4" then
+    if magicBytes == "M.K." or magicBytes == "M!K!" or magicBytes == "M&K!"
+        or magicBytes == "N.T." or magicBytes == "FLT4" then
         numChannels = 4
-    elseif magicBytes == "FLT8" then
-        numChannels = 8
-    elseif magicBytes == "6CHN" then
-        numChannels = 6
-    elseif magicBytes == "8CHN" then
-        numChannels = 8
-    elseif string.sub(magicBytes, 3, 4) == "CH" then
+    elseif magicBytes == "FLT8" or magicBytes == "CD81" or magicBytes == "OKTA" or magicBytes == "OCTA" then
+        numChannels = 8  -- FLT8's split pattern layout is handled below
+    elseif string.sub(magicBytes, 2, 4) == "CHN" and tonumber(string.sub(magicBytes, 1, 1)) then
+        -- "2CHN" … "9CHN"
+        numChannels = tonumber(string.sub(magicBytes, 1, 1))
+    elseif (string.sub(magicBytes, 3, 4) == "CH" or string.sub(magicBytes, 3, 4) == "CN")
+        and tonumber(string.sub(magicBytes, 1, 2)) then
         -- e.g. "10CH", "12CH" … "32CH": the channel count is the first 2 chars.
-        local n = tonumber(string.sub(magicBytes, 1, 2))
-        numChannels = n or 4
+        numChannels = tonumber(string.sub(magicBytes, 1, 2))
+    elseif string.sub(magicBytes, 1, 3) == "TDZ" and tonumber(string.sub(magicBytes, 4, 4)) then
+        numChannels = tonumber(string.sub(magicBytes, 4, 4))
     else
         -- ── Old 15-sample "M15" format ──────────────────────────────────────
         -- No tag, only 15 sample slots, header is 600 bytes.
@@ -396,6 +330,7 @@ local function loadMOD(filename)
         numChannels = 4
     end
     mod.numChannels = numChannels
+    mod.format      = (numSamples == 15) and "M15" or magicBytes
 
     -- Parse sample headers (15 or 31)
     mod.samples = {}
@@ -427,13 +362,58 @@ local function loadMOD(filename)
     end
 
     -- Parse patterns
-    mod.patterns = parsePatterns(fileData, patternBase, highestPattern + 1, numChannels)
+    local patternBytes
+    if magicBytes == "FLT8" then
+        -- Startrekker 8-channel: each pattern is stored as two 4-channel
+        -- patterns (channels 1-4, then 5-8), and the order list counts those
+        -- 4-channel halves, so its entries are always even: halve them.
+        highestPattern = 0
+        for i = 1, 128 do
+            mod.patternTable[i] = math.floor(mod.patternTable[i] / 2)
+            highestPattern = math.max(highestPattern, mod.patternTable[i])
+        end
+        local halves = parsePatterns(fileData, patternBase, (highestPattern + 1) * 2, 4)
+        mod.patterns = {}
+        for p = 0, highestPattern do
+            local pattern, left, right = {}, halves[p * 2], halves[p * 2 + 1]
+            for row = 1, 64 do
+                local rowData = {}
+                for c = 1, 4 do
+                    rowData[c]     = left[row][c]
+                    rowData[c + 4] = right[row][c]
+                end
+                pattern[row] = rowData
+            end
+            mod.patterns[p] = pattern
+        end
+        patternBytes = (highestPattern + 1) * 2 * 64 * 4 * 4
+    else
+        mod.patterns = parsePatterns(fileData, patternBase, highestPattern + 1, numChannels)
+        patternBytes = (highestPattern + 1) * 64 * numChannels * 4
+    end
 
     -- Parse sample data
-    local sampleDataOffset = patternBase + (highestPattern + 1) * 64 * numChannels * 4
+    local sampleDataOffset = patternBase + patternBytes
     for i, sample in ipairs(mod.samples) do
+        sample.baseFinetune = sample.finetune  -- E5x changes finetune; restored on restart
         sample.data = readString(fileData, sampleDataOffset, sample.length)
         sampleDataOffset = sampleDataOffset + sample.length
+        sample.length = #sample.data  -- a truncated file holds less than the header claims
+
+        -- Loop points.  A repeat length of 1 word (2 bytes) means "no loop".
+        -- Old Soundtracker modules store the repeat point in bytes rather than
+        -- words; if the loop runs past the end, try that before clamping it.
+        local ls, ll = sample.loopStart, sample.loopLength
+        if ll > 2 and ls + ll > sample.length then
+            if ls / 2 + ll <= sample.length then
+                ls = ls / 2
+            else
+                ll = sample.length - ls
+            end
+        end
+        sample.hasLoop   = ll > 2
+        sample.loopStart = ls
+        sample.loopEnd   = ls + ll
     end
 
     print(string.format("Loaded: '%s'  samples=%d  channels=%d  orders=%d  patterns=%d",
@@ -448,16 +428,15 @@ local function initializeChannels()
     for i = 1, mod.numChannels do
         local pan = AMIGA_PAN[((i - 1) % 4) + 1]
         channels[i] = {
-            source      = nil,
             period      = 0,        -- current base period (Amiga value)
             volume      = 0,        -- current base volume (0-64)
             pan         = pan,
-            lastSample  = 0,        -- last triggered sample number (1-31)
-            noteIdx     = 1,        -- period-table index of current note (1-60)
+            lastSample  = 0,        -- last instrument number seen (1-31)
+            sampleNum   = 0,        -- sample currently playing (for E9x retrig)
             ftIdx       = 1,        -- finetune row index in PERIOD_TABLE (1-16)
-            -- Portamento (effects 1,2,3,5)
+            -- Portamento (effect 3,5; 1xy/2xy have no memory)
             portaTarget = 0,        -- target period for effect 3
-            portaSpeed  = 0,        -- speed for effects 1,2,3
+            portaSpeed  = 0,        -- speed for effect 3
             glissando   = false,    -- E3x: snap porta to semitones
             -- Vibrato (effects 4,6)
             vibratoSpeed    = 0,
@@ -474,173 +453,47 @@ local function initializeChannels()
             -- Volume slide (effects A,5,6)
             volSlideUp   = 0,
             volSlideDown = 0,
-            -- Arpeggio (effect 0)
-            arpX = 0,
-            arpY = 0,
             -- Sample offset memory (effect 9xx; 9x0 reuses last offset)
             sampleOffset = 0,
             -- Delay note (EDx)
             delayNote = nil,
             delayTick = 0,
-            -- Loop state (set from sampleSources when a sample is triggered)
-            hasLoop        = false,
-            loopStart      = 0,   -- seconds  (LoveDOS fallback)
-            loopEnd        = 0,   -- seconds  (LoveDOS fallback)
-            loopStartFrame = 0,   -- raw sample frames
-            loopEndFrame   = 0,   -- raw sample frames
-            sampleFramePos = 0,   -- running frame counter for software-loop tracking
             -- Current row's note (used by doEffects on in-between ticks)
             currentNote = nil,
+            -- ── Output "registers", read by the backend after every tick ──
+            outPeriod  = 0,     -- period to play this tick (incl. vibrato/arpeggio)
+            outVolume  = 0,     -- volume to play this tick (incl. tremolo)
+            trigSample = nil,   -- set → (re)start this sample on the next commit
+            trigOffset = 0,     -- start offset in bytes for trigSample
         }
         loopRow[i]   = 1   -- default loop start = top of pattern (1-based)
         loopCount[i] = 0
     end
 end
 
--- Helper function to convert a number to a little-endian byte string
-local function toLittleEndian(num, bytes)
-    local res = ""
-    for i = 1, bytes do
-        res = res .. string.char(num % 256)
-        num = math.floor(num / 256)
-    end
-    return res
-end
-
--- Helper function to create a WAV file header
---[[
-Positions   Sample Value         Description
-1 - 4       "RIFF"               Marks the file as a riff file. Characters are each 1. byte long.
-5 - 8       File size (integer)  Size of the overall file - 8 bytes, in bytes (32-bit integer). Typically, you'd fill this in after creation.
-9 -12       "WAVE"               File Type Header. For our purposes, it always equals "WAVE".
-13-16       "fmt "               Format chunk marker. Includes trailing null
-17-20       16                   Length of format data as listed above
-21-22       1                    Type of format (1 is PCM) - 2 byte integer
-23-24       2                    Number of Channels - 2 byte integer
-25-28       44100                Sample Rate - 32 bit integer. Common values are 44100 (CD), 48000 (DAT). Sample Rate = Number of Samples per second, or Hertz.
-29-32       176400               (Sample Rate * BitsPerSample * Channels) / 8.
-33-34       4                    (BitsPerSample * Channels) / 8.1 - 8 bit mono2 - 8 bit stereo/16 bit mono4 - 16 bit stereo
-35-36       16                   Bits per sample
-37-40       "data"               "data" chunk header. Marks the beginning of the data section.
-41-44       File size (data)     Size of the data section, i.e. file size - 44 bytes header.
-]]--
-local function createWavHeader(sampleRate, bitsPerSample, numChannels, numSamples)
-    local subchunk2Size = numSamples * numChannels * (bitsPerSample / 8)
-    --local chunkSize = 36 + subchunk2Size
-	local chunkSize = 36 + subchunk2Size
-    local byteRate = sampleRate * numChannels * (bitsPerSample / 8)
-    local blockAlign = numChannels * (bitsPerSample / 8)
-
-    return table.concat({
-        "RIFF",
-        toLittleEndian(chunkSize, 4),	-- 32 bit integer (4*8 bytes)
-        "WAVE",
-        "fmt ",
-        toLittleEndian(16, 4),  -- Subchunk1Size
-        toLittleEndian(1, 2),   -- AudioFormat (PCM)
-        toLittleEndian(numChannels, 2),
-        toLittleEndian(sampleRate, 4),
-        toLittleEndian(byteRate, 4),
-        toLittleEndian(blockAlign, 2),
-        toLittleEndian(bitsPerSample, 2),
-        "data",
-        toLittleEndian(subchunk2Size, 4)
-    })
-end
-
-local function loadSamples()
-    for i, sample in ipairs(mod.samples) do
-
-        if sample.data and sample.length > 0 then
-
-            -- Create WAV header (Amiga C-2 base: 8363 Hz at period 428)
-            local header = createWavHeader(8363, 8, 1, sample.length)
-
-            -- Convert 8-bit signed PCM to 8-bit unsigned PCM
-            local convertedData = {}
-            for j = 1, sample.length do
-                if (string.byte(sample.data, j) == nil) then
-                    print('Warning: sample data is nil (sample,pos,byte,length):', i, j, string.byte(sample.data, j), sample.length)
-                    break
-                end
-                convertedData[j] = string.char( (string.byte(sample.data, j) + 128) % 256 )
-            end
-            local sampleData = table.concat(convertedData)
-
-            local wavData = header .. sampleData
-
-            -- this is for LoveDos, as newSource must be loaded from disk
-            local tempFile = i .. ".wav"
-            love.filesystem.write(tempFile, wavData, #wavData)
-            -- Load the sample as an audio source
-            local src = love.audio.newSource(tempFile, "static")
-
-            -- MOD loop convention: loopLength > 2 bytes means the sample loops.
-            -- Store loop boundaries both in seconds (LoveDOS fallback) and in raw
-            -- sample frames (accurate software-loop path).
-            local hasLoop = sample.loopLength > 2
-            sampleSources[i] = {
-                source         = src,
-                hasLoop        = hasLoop,
-                loopStart      = sample.loopStart / 8363,                       -- seconds (LoveDOS fallback)
-                loopEnd        = (sample.loopStart + sample.loopLength) / 8363, -- seconds (LoveDOS fallback)
-                loopStartFrame = sample.loopStart,                              -- raw sample frames
-                loopEndFrame   = sample.loopStart + sample.loopLength,          -- raw sample frames
-            }
-			--print(sampleSources[i].hasLoop,sampleSources[i].loopStart,sampleSources[i].loopEnd)
-
-            -- Remove the temporary file
-            -- not supported by LoveDOS
---            love.filesystem.remove(tempFile)
-        else
-            sampleSources[i] = nil  -- Empty sample
-        end
-    end
-end
-
---[[
-local function loadSamples()
-    for i, sample in ipairs(mod.samples) do
-
-        if sample.data and sample.length > 0 then
-            -- Load the sample as an audio source
-            sampleSources[i] = love.audio.newSource(i .. ".wav", "static")
-        else
-            sampleSources[i] = nil  -- Empty sample
-        end
-    end
-end
-]]--
-
 -- ───────────────────────────────────────────────────────────────
 --  Low-level channel helpers
+--  The player core never touches audio objects: it only updates the
+--  channel state and output registers, and the backend applies them.
 -- ───────────────────────────────────────────────────────────────
 
--- Clamp and apply a volume (0-64) to a channel's source and store it.
+-- Clamp and apply a volume (0-64) to a channel and store it as its base volume.
 local function setChannelVolume(ch, vol)
     vol = math.max(0, math.min(64, math.floor(vol)))
     channels[ch].volume = vol
-    if channels[ch].source then
-        channels[ch].source:setVolume(vol / 64)
-    end
+    channels[ch].outVolume = vol
 end
 
--- Store a new base period for a channel and update its source pitch.
--- Does NOT modify the "in-flight" period (e.g. during vibrato).
+-- Store a new base period for a channel and play it.
 local function setChannelPeriod(ch, period)
-    period = math.max(54, math.min(1712, math.floor(period)))
+    period = clampPeriod(period)
     channels[ch].period = period
-    if channels[ch].source then
-        channels[ch].source:setPitch(428 / period)
-    end
+    channels[ch].outPeriod = period
 end
 
 -- Apply a transient pitch offset (vibrato/arpeggio) without storing it.
 local function setPitchDirect(ch, period)
-    period = math.max(54, math.min(1712, math.floor(period)))
-    if channels[ch].source then
-        channels[ch].source:setPitch(428 / period)
-    end
+    channels[ch].outPeriod = clampPeriod(period)
 end
 
 -- Return waveform amplitude (0-255) for position pos (0-31) of the given waveform.
@@ -687,91 +540,52 @@ end
 
 -- Perform portamento-toward-target for a channel.
 local function doPortamento(ch)
-    local cur = channels[ch].period
-    local tgt = channels[ch].portaTarget
-    local spd = channels[ch].portaSpeed
+    local c   = channels[ch]
+    local cur = c.period
+    local tgt = c.portaTarget
+    local spd = c.portaSpeed
     if tgt == 0 or cur == tgt then return end
     if cur < tgt then
         cur = math.min(cur + spd, tgt)
     else
         cur = math.max(cur - spd, tgt)
     end
-    -- Glissando: snap to nearest semitone in the finetune table
-    if channels[ch].glissando then
-        local ft = channels[ch].ftIdx
-        local best = 1
-        local bestDiff = math.huge
-        for i = 1, 60 do
-            local d = math.abs(PERIOD_TABLE[ft][i] - cur)
-            if d < bestDiff then bestDiff = d; best = i end
-        end
-        cur = PERIOD_TABLE[ft][best]
-    end
     setChannelPeriod(ch, cur)
+    -- Glissando: the slide itself stays smooth, only the audible pitch snaps
+    -- to the nearest semitone.  (Snapping the stored period would make slow
+    -- slides round back to the start note every tick and never arrive.)
+    if c.glissando then
+        c.outPeriod = PERIOD_TABLE[c.ftIdx][nearestNote(c.ftIdx, cur)]
+    end
 end
 
 -- ───────────────────────────────────────────────────────────────
 --  triggerSample: start/restart sample playback for a channel.
 --  Called from playNote (tick 0) and doEffects (EDx delay).
+--  finetune overrides the sample's finetune (E5x on the same row).
 -- ───────────────────────────────────────────────────────────────
-local function triggerSample(channel, note, seekBytes)
-    seekBytes = seekBytes or 0
+local function triggerSample(channel, note, seekBytes, finetune)
     local ch = channels[channel]
 
     -- Determine which sample number to use
     local sampleNum = (note.sample > 0) and note.sample or ch.lastSample
-    if not sampleNum or sampleNum <= 0 or sampleNum > 31 then return end
-    local sampleEntry = sampleSources[sampleNum]
-    if not sampleEntry then return end
+    local sample = mod.samples[sampleNum]
+    if not sample then return end
 
-    -- Clamp a sample-offset (effect 9xx) request to the sample's length.  A
-    -- value past the end seeks to the end (silence), matching ProTracker,
-    -- rather than wrongly restarting playback from the beginning.
-    local sLen = mod.samples[sampleNum].length or 0
-    if seekBytes > sLen then seekBytes = sLen end
+    -- Ask the backend to (re)start the sample after this tick.  An empty
+    -- sample still triggers: it silences the channel, as in ProTracker.  An
+    -- offset past the end is resolved by the backend (loop part or silence).
+    ch.sampleNum  = sampleNum
+    ch.trigSample = sampleNum
+    ch.trigOffset = seekBytes or 0
 
-    -- Stop previous source
-    if ch.source then ch.source:stop() end
-
-    -- Clone or share the underlying LÖVE source
-    local baseSrc = sampleEntry.source
-    if baseSrc.clone then
-        ch.source = baseSrc:clone()
-    else
-        ch.source = baseSrc
-    end
-
-    -- Store loop boundaries for both the accurate (frame) and fallback (seconds) paths.
-    ch.hasLoop        = sampleEntry.hasLoop
-    ch.loopStart      = sampleEntry.loopStart
-    ch.loopEnd        = sampleEntry.loopEnd
-    ch.loopStartFrame = sampleEntry.loopStartFrame
-    ch.loopEndFrame   = sampleEntry.loopEndFrame
-    -- Reset the frame counter; seekBytes offset is applied below via source:seek()
-    -- so the counter starts there too.
-    ch.sampleFramePos = seekBytes
-
-    -- Apply current channel volume
-    ch.source:setVolume(ch.volume / 64)
-
-    -- Determine finetune and closest note index
-    local sample  = mod.samples[sampleNum]
-    local finetune = sample.finetune or 0
-    local ft_idx   = (finetune >= 0) and (finetune + 1) or (finetune + 17)
-    ch.ftIdx = ft_idx
-
-    local bestIdx  = 1
-    local bestDiff = math.huge
-    for i = 1, 60 do
-        local d = math.abs(PERIOD_TABLE[1][i] - note.period)
-        if d < bestDiff then bestDiff = d; bestIdx = i end
-    end
-    ch.noteIdx = bestIdx
-
-    -- Set pitch using the finetune-adjusted period
-    local tunedPeriod = PERIOD_TABLE[ft_idx][bestIdx]
-    ch.period = tunedPeriod
-    ch.source:setPitch(428 / tunedPeriod)
+    -- Set pitch using the finetune-adjusted period (FMODDOC §3.4)
+    local ftIdx = ftIndex(finetune or sample.finetune or 0)
+    ch.ftIdx = ftIdx
+    local tunedPeriod = PERIOD_TABLE[ftIdx][nearestNote(1, note.period)]
+    ch.period    = tunedPeriod
+    ch.outPeriod = tunedPeriod
+    ch.outVolume = ch.volume
 
     -- Reset vibrato/tremolo phase if waveform < 4 (retrig enabled)
     if ch.vibratoWaveform < 4 then
@@ -780,14 +594,6 @@ local function triggerSample(channel, note, seekBytes)
     if ch.tremoloWaveform < 4 then
         ch.tremoloPos = 0; ch.tremoloNeg = 0
     end
-
-    -- Seek to sample offset if requested (effect 9); already clamped above.
-    if seekBytes > 0 then
-        pcall(function() ch.source:seek(seekBytes / 8363) end)
-    end
-
-    ch.source:play()
-    applyPan(ch.source, ch.pan)
 end
 
 -- ───────────────────────────────────────────────────────────────
@@ -797,40 +603,41 @@ local function playNote(channel, note)
     local ch      = channels[channel]
     local effect  = note.effect
     local param   = note.effectParam
-    local ex      = bit32.rshift(param, 4)   -- high nibble
-    local ey      = bit32.band (param, 0x0F) -- low  nibble
+    local ex      = hiNibble(param)   -- high nibble
+    local ey      = loNibble(param)   -- low  nibble
 
     -- Remember this row's note so doEffects can continue it on in-between ticks
     ch.currentNote = note
+    ch.delayNote   = nil
 
     -- Clear any residual transient pitch/volume left by the previous row's
     -- vibrato / tremolo / arpeggio.  ProTracker reloads the base period and
     -- volume at the start of every row (tick 0); the oscillating effects then
     -- re-apply their offset on ticks > 0.  Without this, a vibrato row followed
     -- by a plain row stays detuned, and tremolo sticks at the wrong volume.
-    if ch.source then
-        if ch.period > 0 then
-            ch.source:setPitch(428 / math.max(54, math.min(1712, ch.period)))
-        end
-        ch.source:setVolume(ch.volume / 64)
-    end
+    ch.outPeriod = ch.period
+    ch.outVolume = ch.volume
 
     -- Porta-to-Note flag: don't restart the sample (effects 3 and 5)
     local isPorta = (effect == 0x3 or effect == 0x5)
-    -- Delay-Note flag: don't play now (effect EDx)
-    local isDelay = (effect == 0xE and ex == 0xD)
+    -- Delay-Note flag: don't play now (effect EDx; ED0 plays immediately)
+    local isDelay = (effect == 0xE and ex == 0xD and ey > 0)
 
     -- ── Section 4.1: volume reset only when instrument number is present ──
-    if note.sample > 0 and note.sample <= 31 then
-        local sampleVol = mod.samples[note.sample].volume
-        ch.volume = sampleVol
-        if ch.source then ch.source:setVolume(sampleVol / 64) end
+    local instrument = note.sample > 0 and mod.samples[note.sample]
+    if instrument then
+        ch.volume    = instrument.volume
+        ch.outVolume = instrument.volume
         ch.lastSample = note.sample
     end
 
     -- ── Porta target / speed update (effect 3) ──
     if isPorta then
-        if note.period > 0 then ch.portaTarget = note.period end
+        if note.period > 0 then
+            -- Slide to the finetuned period, the same one a normal trigger plays
+            local s = mod.samples[ch.lastSample]
+            ch.portaTarget = PERIOD_TABLE[ftIndex(s and s.finetune or 0)][nearestNote(1, note.period)]
+        end
         if effect == 0x3 and param ~= 0 then ch.portaSpeed = param end
         -- Effect 5 param = vol-slide amounts (handled below)
     end
@@ -843,7 +650,12 @@ local function playNote(channel, note)
             if param ~= 0 then ch.sampleOffset = param * 0x100 end
             seekBytes = ch.sampleOffset
         end
-        triggerSample(channel, note, seekBytes)
+        local finetune
+        if effect == 0xE and ex == 0x5 then
+            -- E5x: Set Finetune – applies to this note already (§5.21)
+            finetune = (ey > 7) and (ey - 16) or ey
+        end
+        triggerSample(channel, note, seekBytes, finetune)
     elseif note.period > 0 and isDelay then
         -- Store for later playback at tick EDy
         ch.delayNote = note
@@ -854,16 +666,10 @@ local function playNote(channel, note)
     --  Tick-0 effects
     -- ───────────────────────────────────────────────────────────
     if effect == 0x0 then
-        -- 0xy Arpeggio: store semitone amounts (executed on ticks > 0)
-        if param ~= 0 then ch.arpX = ex; ch.arpY = ey end
+        -- 0xy Arpeggio: executed on ticks > 0 straight from the note's param
 
-    elseif effect == 0x1 then
-        -- 1xy Porta Up: remember speed (slide happens on ticks > 0)
-        if param ~= 0 then ch.portaSpeed = param end
-
-    elseif effect == 0x2 then
-        -- 2xy Porta Down: remember speed
-        if param ~= 0 then ch.portaSpeed = param end
+    elseif effect == 0x1 or effect == 0x2 then
+        -- 1xy / 2xy Porta Up/Down: slide on ticks > 0, no effect memory
 
     elseif effect == 0x4 then
         -- 4xy Vibrato: update speed/depth if non-zero
@@ -884,11 +690,13 @@ local function playNote(channel, note)
         if ey ~= 0 then ch.tremoloDepth = ey end
 
     elseif effect == 0x8 then
-        -- 8xy Pan: spec §5.9 – 00=left, 40=centre, 80=right
-        -- Range 0..128 maps to -1..+1; values above 128 clamp to +1.
-        local pan = math.max(-1.0, math.min(1.0, (param / 64.0) - 1.0))
-        ch.pan = pan
-        if ch.source then applyPan(ch.source, pan) end
+        -- 8xy Pan: spec §5.9 – 00=left, 40=centre, 80=right, A4=surround
+        if param == 0xA4 then
+            ch.pan = 0  -- surround needs a phase-inverted twin voice: centre it
+        else
+            -- Range 0..128 maps to -1..+1; values above 128 clamp to +1.
+            ch.pan = math.max(-1.0, math.min(1.0, (param / 64.0) - 1.0))
+        end
 
     elseif effect == 0x9 then
         -- 9xy Sample Offset: already applied in triggerSample above
@@ -903,9 +711,7 @@ local function playNote(channel, note)
 
     elseif effect == 0xC then
         -- Cxy Set Volume
-        local vol = math.min(param, 64)
-        ch.volume = vol
-        if ch.source then ch.source:setVolume(vol / 64) end
+        setChannelVolume(channel, param)
 
     elseif effect == 0xD then
         -- Dxy Pattern Break (decimal: x*10+y rows into next pattern)
@@ -914,10 +720,12 @@ local function playNote(channel, note)
         breakToRow = row
 
     elseif effect == 0xF then
-        -- Fxy Set Speed / BPM
-        if param > 0 and param <= 31 then
+        -- Fxy Set Speed / BPM; F00 stops the song (ProTracker)
+        if param == 0 then
+            songEnded = true
+        elseif param <= 31 then
             ticksPerRow = param
-        elseif param >= 32 then
+        else
             bpm = param
         end
 
@@ -946,16 +754,17 @@ local function playNote(channel, note)
             ch.vibratoWaveform = val
 
         elseif sub == 0x5 then
-            -- E5x: Set Finetune for current sample
+            -- E5x: Set Finetune for the instrument (§5.21); the current note
+            -- already used it in triggerSample above.
             local ft = val; if ft > 7 then ft = ft - 16 end
-            if note.sample > 0 and note.sample <= 31 then
-                mod.samples[note.sample].finetune = ft
+            if instrument then
+                instrument.finetune = ft
             end
 
         elseif sub == 0x6 then
             -- E6x: Pattern Loop (per channel).  E60 marks the loop start row;
             -- E6x (x>0) jumps back to it x times before continuing.  The jump
-            -- target is consumed at the row boundary in processMOD (loopToRow),
+            -- target is consumed at the row boundary in advanceRow (loopToRow),
             -- staying within the SAME pattern – no order advance.
             if val == 0 then
                 loopRow[channel] = currentRow     -- mark loop start
@@ -979,7 +788,6 @@ local function playNote(channel, note)
             local pan = (val / 7.5) - 1.0
             pan = math.max(-1.0, math.min(1.0, pan))
             ch.pan = pan
-            if ch.source then applyPan(ch.source, pan) end
 
         elseif sub == 0xA then
             -- EAx: Fine Volume Slide Up (tick 0 only)
@@ -988,6 +796,10 @@ local function playNote(channel, note)
         elseif sub == 0xB then
             -- EBx: Fine Volume Slide Down (tick 0 only)
             setChannelVolume(channel, ch.volume - val)
+
+        elseif sub == 0xC then
+            -- ECx: Cut Note – EC0 cuts right away, others in doEffects
+            if val == 0 then setChannelVolume(channel, 0) end
 
         elseif sub == 0xD then
             -- EDx: Delay Note – stored above; actual play in doEffects
@@ -1011,31 +823,27 @@ local function doEffects()
 
         local effect = note.effect
         local param  = note.effectParam
-        local ex     = bit32.rshift(param, 4)
-        local ey     = bit32.band (param, 0x0F)
+        local ex     = hiNibble(param)
+        local ey     = loNibble(param)
 
         -- ── 0xy Arpeggio ──────────────────────────────────────
         if effect == 0x0 and param ~= 0 then
+            -- Relative to the current period, so it also follows slides
             local phase = currentTick % 3
-            local idx
             if phase == 0 then
-                idx = ch.noteIdx                           -- base note
-            elseif phase == 1 then
-                idx = math.min(ch.noteIdx + ch.arpX, 60)  -- + x semitones
+                setPitchDirect(channel, ch.period)               -- base note
             else
-                idx = math.min(ch.noteIdx + ch.arpY, 60)  -- + y semitones
+                local idx = nearestNote(ch.ftIdx, ch.period) + ((phase == 1) and ex or ey)
+                setPitchDirect(channel, PERIOD_TABLE[ch.ftIdx][math.min(idx, 60)])
             end
-            setPitchDirect(channel, PERIOD_TABLE[ch.ftIdx][idx])
 
         -- ── 1xy Porta Up ──────────────────────────────────────
         elseif effect == 0x1 then
-            if param ~= 0 then ch.portaSpeed = param end
-            setChannelPeriod(channel, ch.period - ch.portaSpeed)
+            setChannelPeriod(channel, ch.period - param)
 
         -- ── 2xy Porta Down ────────────────────────────────────
         elseif effect == 0x2 then
-            if param ~= 0 then ch.portaSpeed = param end
-            setChannelPeriod(channel, ch.period + ch.portaSpeed)
+            setChannelPeriod(channel, ch.period + param)
 
         -- ── 3xy / 5xy Porta To Note (+ optional vol slide) ───
         elseif effect == 0x3 or effect == 0x5 then
@@ -1043,9 +851,9 @@ local function doEffects()
             if effect == 0x5 then doVolumeSlide(channel) end
 
         -- ── 4xy / 6xy Vibrato (+ optional vol slide) ─────────
+        -- Speed/depth were latched on tick 0 by 4xy only: 6xy's param is the
+        -- volume slide and must not overwrite the vibrato settings.
         elseif effect == 0x4 or effect == 0x6 then
-            if ex ~= 0 then ch.vibratoSpeed = ex end
-            if ey ~= 0 then ch.vibratoDepth = ey end
             local delta, newPos, newNeg = oscillatorStep(
                 ch.vibratoWaveform, ch.vibratoPos, ch.vibratoNeg,
                 ch.vibratoSpeed, ch.vibratoDepth, 128)
@@ -1055,15 +863,12 @@ local function doEffects()
 
         -- ── 7xy Tremolo ───────────────────────────────────────
         elseif effect == 0x7 then
-            if ex ~= 0 then ch.tremoloSpeed = ex end
-            if ey ~= 0 then ch.tremoloDepth = ey end
             local delta, newPos, newNeg = oscillatorStep(
                 ch.tremoloWaveform, ch.tremoloPos, ch.tremoloNeg,
                 ch.tremoloSpeed, ch.tremoloDepth, 64)
             ch.tremoloPos = newPos; ch.tremoloNeg = newNeg
             -- Apply temporary volume (don't store; tremolo doesn't modify base vol)
-            local effVol = math.max(0, math.min(64, ch.volume + delta))
-            if ch.source then ch.source:setVolume(effVol / 64) end
+            ch.outVolume = math.max(0, math.min(64, ch.volume + delta))
 
         -- ── Axy Volume Slide ──────────────────────────────────
         elseif effect == 0xA then
@@ -1075,12 +880,10 @@ local function doEffects()
             local val = ey
 
             if sub == 0x9 then
-                -- E9x: Retrig Note every x ticks
-                if val > 0 and currentTick % val == 0 then
-                    if ch.source then
-                        pcall(function() ch.source:seek(0) end)
-                        ch.source:play()
-                    end
+                -- E9x: Retrig Note every x ticks (from the sample start)
+                if val > 0 and currentTick % val == 0 and ch.sampleNum > 0 then
+                    ch.trigSample = ch.sampleNum
+                    ch.trigOffset = 0
                 end
 
             elseif sub == 0xC then
@@ -1094,9 +897,7 @@ local function doEffects()
                 if currentTick == val and ch.delayNote then
                     local dn = ch.delayNote
                     ch.delayNote = nil
-                    if dn.period > 0 then
-                        triggerSample(channel, dn, 0)
-                    end
+                    triggerSample(channel, dn, 0)
                 end
             end
         end
@@ -1109,274 +910,1009 @@ end
 --  updateRow  – play all channels for the current row
 -- ───────────────────────────────────────────────────────────────
 local function updateRow()
+    local pattern = mod.patterns[currentPattern]
+    local rowData = pattern and pattern[currentRow]
+    if not rowData then return end
     for channel = 1, mod.numChannels do
-        local note = mod.patterns[currentPattern]
-            and mod.patterns[currentPattern][currentRow]
-            and mod.patterns[currentPattern][currentRow][channel]
+        local note = rowData[channel]
         if note then
             playNote(channel, note)
         end
     end
-end
-
--- ───────────────────────────────────────────────────────────────
---  processMOD  – main tick/row driver
--- ───────────────────────────────────────────────────────────────
-local function processMOD(dt)
-    local tickRate = 2 * bpm / 5   -- ticks per second  (125 BPM → 50 ticks/sec)
-    tickAccum = tickAccum + dt * tickRate
-
-    while tickAccum >= 1 do
-        tickAccum = tickAccum - 1
-        currentTick = currentTick + 1
-
-        if currentTick >= ticksPerRow then
-            currentTick = 0
-
-            if patDelay > 0 then
-                -- Pattern Delay: hold current row, keep effects running
-                patDelay = patDelay - 1
-                -- (channels continue their in-between effects via doEffects below)
-            else
-                -- Apply any pending pattern jump (Bxy) or pattern break (Dxy)
-                if jumpToOrder ~= nil then
-                    currentPatternIndex = math.min(jumpToOrder + 1, mod.songLength)
-                    currentPattern      = mod.patternTable[currentPatternIndex]
-                    currentRow          = (breakToRow or 0) + 1  -- 1-based
-                    jumpToOrder         = nil
-                    breakToRow          = nil
-                elseif breakToRow ~= nil then
-                    currentPatternIndex = currentPatternIndex + 1
-                    if currentPatternIndex > mod.songLength then
-                        currentPatternIndex = mod.restartPosition + 1
-                    end
-                    currentPattern = mod.patternTable[currentPatternIndex]
-                    currentRow     = breakToRow + 1   -- 0-based → 1-based
-                    breakToRow     = nil
-                elseif loopToRow ~= nil then
-                    -- E6x Pattern Loop: jump back within the current pattern
-                    currentRow = loopToRow
-                    loopToRow  = nil
-                else
-                    -- Normal row advance
-                    currentRow = currentRow + 1
-                    if currentRow > 64 then
-                        currentRow          = 1
-                        currentPatternIndex = currentPatternIndex + 1
-                        if currentPatternIndex > mod.songLength then
-                            currentPatternIndex = mod.restartPosition + 1
-                        end
-                        currentPattern = mod.patternTable[currentPatternIndex]
-                    end
-                end
-
-                updateRow()  -- tick 0 processing (may set jumpToOrder / breakToRow)
-            end
-        else
-            -- In-between ticks: run tick-based effects
-            doEffects()
-        end
-
-        -- ── Accurate software-loop: advance per-channel frame counters ────────
-        -- Each tick has an exact duration of 5/(2*bpm) seconds.  Multiplying by
-        -- the pitch factor (428/period) and the base sample rate (8363 Hz) gives
-        -- the exact number of source frames consumed this tick, independent of
-        -- any pitch drift from vibrato or arpeggio (those oscillate around the
-        -- base period so the error averages to zero over a cycle).
-        --
-        -- seek() formula: tell()/seek() on this LÖVE build operate in wall-clock
-        -- (real) seconds, i.e.  position = frames / (pitch × 8363).  If your
-        -- build uses source-data seconds instead, replace the seek call with:
-        --   ch.source:seek(ch.sampleFramePos / 8363, "seconds")
-        if USE_SOFTWARE_LOOP then
-            local secondsPerTick = 5 / (2 * bpm)
-            for ci = 1, mod.numChannels do
-                local ch = channels[ci]
-                if ch.source and ch.hasLoop and ch.source:isPlaying() and ch.period > 0 then
-                    local pitch   = 428 / ch.period
-                    local loopLen = ch.loopEndFrame - ch.loopStartFrame
-                    ch.sampleFramePos = ch.sampleFramePos + secondsPerTick * pitch * 8363
-                    if loopLen > 0 and ch.sampleFramePos >= ch.loopEndFrame then
-                        while ch.sampleFramePos >= ch.loopEndFrame do
-                            ch.sampleFramePos = ch.sampleFramePos - loopLen
-                        end
-                        ch.source:seek(ch.sampleFramePos / (pitch * 8363), "seconds")
-                    end
-                end
-            end
-        end
-    end
-
-    -- LoveDOS fallback: coarse tell()-based loop check.
-    -- Drifts at pitches other than C-2 (period 428) but costs almost nothing.
-    -- Only active when USE_SOFTWARE_LOOP = false.
-    if not USE_SOFTWARE_LOOP then
+    if songEnded then
+        -- F00: stop at once, like ProTracker.  Sample 0 does not exist, so the
+        -- trigger makes every backend silence its voice.
         for channel = 1, mod.numChannels do
             local ch = channels[channel]
-            if ch.source and ch.hasLoop and ch.source:isPlaying() then
-                local pos = ch.source:tell("seconds")
-                if pos >= ch.loopEnd then
-                    local overshoot = pos - ch.loopEnd
-                    ch.source:seek(ch.loopStart + overshoot, "seconds")
-                end
-            end
+            ch.trigSample, ch.trigOffset = 0, 0
+            ch.currentNote = nil
         end
     end
 end
 
--- tick driver: love.update
-function love.update(dt)
-    if not play then return end
+-- ───────────────────────────────────────────────────────────────
+--  advanceRow  – move to the next row, honouring Bxy / Dxy / E6x
+-- ───────────────────────────────────────────────────────────────
+local function advanceRow()
+    if jumpToOrder ~= nil then
+        currentPatternIndex = math.min(jumpToOrder + 1, mod.songLength)
+        currentPattern      = mod.patternTable[currentPatternIndex]
+        currentRow          = (breakToRow or 0) + 1  -- 1-based
+        jumpToOrder         = nil
+        breakToRow          = nil
+    elseif breakToRow ~= nil then
+        currentPatternIndex = currentPatternIndex + 1
+        if currentPatternIndex > mod.songLength then
+            currentPatternIndex = mod.restartPosition + 1
+        end
+        currentPattern = mod.patternTable[currentPatternIndex]
+        currentRow     = breakToRow + 1   -- 0-based → 1-based
+        breakToRow     = nil
+    elseif loopToRow ~= nil then
+        -- E6x Pattern Loop: jump back within the current pattern
+        currentRow = loopToRow
+        loopToRow  = nil
+    else
+        -- Normal row advance
+        currentRow = currentRow + 1
+        if currentRow > 64 then
+            currentRow          = 1
+            currentPatternIndex = currentPatternIndex + 1
+            if currentPatternIndex > mod.songLength then
+                currentPatternIndex = mod.restartPosition + 1
+            end
+            currentPattern = mod.patternTable[currentPatternIndex]
+        end
+    end
+end
 
-    -- On the very first update after starting, trigger row if needed
+-- ───────────────────────────────────────────────────────────────
+--  playerTick  – advance the song by exactly one tick (FMODDOC §3.3)
+--  Called 2*BPM/5 times per second by the backend.
+-- ───────────────────────────────────────────────────────────────
+local function playerTick()
+    -- Trigger requests last one tick: every consumer (backend, visualiser
+    -- mixer) reads the registers after the tick, none of them clears them.
+    for c = 1, mod.numChannels do channels[c].trigSample = nil end
+    if songEnded then return end
+    songTime = songTime + 5 / (2 * bpm)
+    currentTick = currentTick + 1
+
     if currentTick >= ticksPerRow then
         currentTick = 0
-        updateRow()
+
+        if patDelay > 0 then
+            -- Pattern Delay: hold current row, no new notes, but the effects
+            -- keep running (§5.30)
+            patDelay = patDelay - 1
+            doEffects()
+        else
+            if songStarted then advanceRow() end
+            songStarted = true
+            updateRow()  -- tick 0 processing (may set jumpToOrder / breakToRow)
+        end
+    else
+        -- In-between ticks: run tick-based effects
+        doEffects()
+    end
+end
+
+-- ═══════════════════════════════════════════════════════════════
+--  Backend 1: software mixer (normal LÖVE)
+-- ═══════════════════════════════════════════════════════════════
+local Mixer = {}
+local mixQueue, mixSoundData, mixOut
+local mixL, mixR = {}, {}
+local mixGain    = 0.5
+local tickRemain = 0      -- output frames left until the next player tick
+
+-- ── Visualiser tap (desktop UI only) ─────────────────────────────
+-- A mono copy of the output in a ring buffer plus a callback per tick, both
+-- stamped with output frame positions, so the UI shows what is being heard.
+local vizRing          -- int16 ring buffer (FFI), nil when no UI is attached
+local VIZ_RING = 16384 -- ring size in frames (power of two)
+local vizFrames = 0    -- frames written so far (also indexes the ring)
+local onTickHook       -- function(framePos), called after every player tick
+
+-- Copy mixed frames 1..n into the ring
+local function vizWrite(n)
+    if not vizRing then return end
+    for i = 1, n do
+        local v = (mixL[i] + mixR[i]) * 0.5
+        if v > 1 then v = 1 elseif v < -1 then v = -1 end
+        vizRing[(vizFrames + i - 1) % VIZ_RING] = v * 32767
+    end
+    vizFrames = vizFrames + n
+end
+
+-- Decode every sample to floats and reset the voices.  Used by the mixer and,
+-- on desktop, by the Source backend to drive the visualisers.
+function Mixer.prepare()
+    -- Data past the loop end is never played (ProTracker loops back there),
+    -- so it is dropped.
+    for _, sample in ipairs(mod.samples) do
+        if sample.length > 0 then
+            local frames = sample.hasLoop and sample.loopEnd or sample.length
+            local pcm = {}
+            for j = 1, frames do
+                local b = string.byte(sample.data, j)
+                pcm[j] = ((b < 128) and b or (b - 256)) / 128
+            end
+            sample.pcm = pcm
+        end
+    end
+    mixGain = 1 / math.sqrt(mod.numChannels)
+    tickRemain = 0
+    for c = 1, mod.numChannels do
+        local ch = channels[c]
+        ch.vActive, ch.vPos, ch.vStep, ch.gainL, ch.gainR = false, 0, 0, 0, 0
+    end
+end
+
+-- Start a fresh output stream (drops anything still queued)
+function Mixer.flush()
+    if mixQueue then mixQueue:stop() end
+    mixQueue = love.audio.newQueueableSource(MIX_RATE, 16, 2, MIX_BUFFERS)
+end
+
+function Mixer.load()
+    Mixer.prepare()
+    Mixer.flush()
+    if not mixSoundData then
+        mixSoundData = love.sound.newSoundData(MIX_BUFFER, MIX_RATE, 16, 2)
+        -- Fast path: write straight into the SoundData memory (LÖVE 11.3+)
+        local ok, ffi = pcall(require, "ffi")
+        if ok and mixSoundData.getFFIPointer then
+            mixOut = ffi.cast("int16_t*", mixSoundData:getFFIPointer())
+        end
+    end
+end
+
+-- Latch one channel's output registers into its voice
+function Mixer.commit(c)
+    local ch = channels[c]
+    if ch.trigSample then
+        local sample = mod.samples[ch.trigSample]
+        ch.vActive = false
+        if sample and sample.pcm then
+            ch.vData    = sample.pcm
+            ch.vLoopLen = sample.hasLoop and (sample.loopEnd - sample.loopStart) or 0
+            ch.vEnd     = #sample.pcm
+            local pos = ch.trigOffset
+            if pos >= ch.vEnd then
+                -- Offset past the end: a looped sample continues in its loop,
+                -- anything else is silent (§5.10)
+                pos = (ch.vLoopLen > 0) and sample.loopStart or ch.vEnd
+            end
+            ch.vPos    = pos
+            ch.vActive = pos < ch.vEnd
+        end
+    end
+    local period = ch.outPeriod
+    ch.vStep = (period > 0) and (AMIGA_CLOCK / clampPeriod(period) / MIX_RATE) or 0
+    -- Constant-power pan: hard left/right like Paula, centre at -3 dB per side
+    local vol   = ch.outVolume / 64 * mixGain
+    local angle = (ch.pan + 1) * math.pi / 4
+    ch.gainL = vol * math.cos(angle)
+    ch.gainR = vol * math.sin(angle)
+end
+
+-- Mix frames first..last of the current buffer
+local function mixFrames(first, last)
+    local floor = math.floor
+    for i = first, last do mixL[i] = 0; mixR[i] = 0 end
+    for c = 1, mod.numChannels do
+        local ch = channels[c]
+        if ch.vActive and ch.vStep > 0 then
+            local data, pos, step = ch.vData, ch.vPos, ch.vStep
+            local gl, gr = ch.gainL, ch.gainR
+            local vEnd, loopLen = ch.vEnd, ch.vLoopLen
+            -- Sample that follows the last one: the loop start, or silence
+            local wrap = (loopLen > 0) and data[vEnd - loopLen + 1] or 0
+            for i = first, last do
+                local ip = floor(pos)
+                local s  = data[ip + 1]
+                if interpolate then
+                    s = s + ((data[ip + 2] or wrap) - s) * (pos - ip)
+                end
+                mixL[i] = mixL[i] + s * gl
+                mixR[i] = mixR[i] + s * gr
+                pos = pos + step
+                if pos >= vEnd then
+                    if loopLen > 0 then
+                        repeat pos = pos - loopLen until pos < vEnd
+                    else
+                        ch.vActive = false
+                        break
+                    end
+                end
+            end
+            ch.vPos = pos
+        end
+    end
+end
+
+-- Render one buffer, running player ticks at their exact sample positions
+local function renderBuffer()
+    local i = 1
+    while i <= MIX_BUFFER do
+        if tickRemain <= 0 then
+            playerTick()
+            for c = 1, mod.numChannels do Mixer.commit(c) end
+            if onTickHook then onTickHook(vizFrames + i - 1) end
+            tickRemain = tickRemain + MIX_RATE * 5 / (2 * bpm)
+        end
+        local n = math.min(MIX_BUFFER - i + 1, math.ceil(tickRemain))
+        mixFrames(i, i + n - 1)
+        i = i + n
+        tickRemain = tickRemain - n
     end
 
-    processMOD(dt)
+    for i = 1, MIX_BUFFER do
+        local l, r = mixL[i], mixR[i]
+        if l > 1 then l = 1 elseif l < -1 then l = -1 end
+        if r > 1 then r = 1 elseif r < -1 then r = -1 end
+        if mixOut then
+            mixOut[i * 2 - 2] = l * 32767
+            mixOut[i * 2 - 1] = r * 32767
+        else
+            mixSoundData:setSample(i - 1, 1, l)
+            mixSoundData:setSample(i - 1, 2, r)
+        end
+    end
+    vizWrite(MIX_BUFFER)
 end
+
+function Mixer.update(dt)
+    while mixQueue:getFreeBufferCount() > 0 do
+        renderBuffer()
+        mixQueue:queue(mixSoundData)
+    end
+    if not mixQueue:isPlaying() then mixQueue:play() end
+end
+
+function Mixer.stop()
+    mixQueue:pause()   -- keeps the queued audio; play() resumes seamlessly
+end
+
+function Mixer.level(c)
+    local ch = channels[c]
+    return ch.vActive and ch.outVolume / 64 or 0
+end
+
+-- Output frame being heard now (to within one buffer)
+function Mixer.position()
+    local queued = MIX_BUFFERS - mixQueue:getFreeBufferCount()
+    return math.max(0, vizFrames - queued * MIX_BUFFER)
+end
+
+-- ═══════════════════════════════════════════════════════════════
+--  Backend 2: LoveDOS compatibility layer (one Source per sample part)
+--
+--  LoveDOS Sources offer setVolume/setPitch/setLooping/isPlaying/tell/play/
+--  stop – no seek(), clone(), setPosition() or getVolume().  So:
+--    * every sample is written as  s<N>.wav  up to its loop end; a loop that
+--      starts at 0 simply loops that file (gapless)
+--    * a loop starting later gets  s<N>l.wav, started when the head finishes
+--      (a gap of up to one frame)
+--    * each 9xx offset used by the song gets a pre-cut  s<N>o<xx>.wav
+--    * every channel has its own Source objects, so the same sample can play
+--      on several channels at once
+--  Not reproducible here: panning on LoveDOS, sample-exact timing (ticks run
+--  from love.update) and the gapless head → loop transition.
+--  File names stay within DOS 8.3 limits.
+-- ═══════════════════════════════════════════════════════════════
+local Source = {}
+local sampleFiles    = {}  -- [sample] = { head, headEnd, headLoops, loop, offsets }
+local channelSources = {}  -- [channel][file] = LÖVE Source
+local tickAccum      = 0   -- accumulates real time; fires one tick when >= 1
+
+-- Helper function to convert a number to a little-endian byte string
+local function toLittleEndian(num, bytes)
+    local res = ""
+    for i = 1, bytes do
+        res = res .. string.char(num % 256)
+        num = math.floor(num / 256)
+    end
+    return res
+end
+
+-- Helper function to create a WAV file header
+--[[
+Positions   Sample Value         Description
+1 - 4       "RIFF"               Marks the file as a riff file. Characters are each 1. byte long.
+5 - 8       File size (integer)  Size of the overall file - 8 bytes, in bytes (32-bit integer). Typically, you'd fill this in after creation.
+9 -12       "WAVE"               File Type Header. For our purposes, it always equals "WAVE".
+13-16       "fmt "               Format chunk marker. Includes trailing null
+17-20       16                   Length of format data as listed above
+21-22       1                    Type of format (1 is PCM) - 2 byte integer
+23-24       2                    Number of Channels - 2 byte integer
+25-28       44100                Sample Rate - 32 bit integer. Common values are 44100 (CD), 48000 (DAT). Sample Rate = Number of Samples per second, or Hertz.
+29-32       176400               (Sample Rate * BitsPerSample * Channels) / 8.
+33-34       4                    (BitsPerSample * Channels) / 8.1 - 8 bit mono2 - 8 bit stereo/16 bit mono4 - 16 bit stereo
+35-36       16                   Bits per sample
+37-40       "data"               "data" chunk header. Marks the beginning of the data section.
+41-44       File size (data)     Size of the data section, i.e. file size - 44 bytes header.
+]]--
+local function createWavHeader(sampleRate, bitsPerSample, numChannels, numSamples)
+    local subchunk2Size = numSamples * numChannels * (bitsPerSample / 8)
+	local chunkSize = 36 + subchunk2Size
+    local byteRate = sampleRate * numChannels * (bitsPerSample / 8)
+    local blockAlign = numChannels * (bitsPerSample / 8)
+
+    return table.concat({
+        "RIFF",
+        toLittleEndian(chunkSize, 4),	-- 32 bit integer (4*8 bytes)
+        "WAVE",
+        "fmt ",
+        toLittleEndian(16, 4),  -- Subchunk1Size
+        toLittleEndian(1, 2),   -- AudioFormat (PCM)
+        toLittleEndian(numChannels, 2),
+        toLittleEndian(sampleRate, 4),
+        toLittleEndian(byteRate, 4),
+        toLittleEndian(blockAlign, 2),
+        toLittleEndian(bitsPerSample, 2),
+        "data",
+        toLittleEndian(subchunk2Size, 4)
+    })
+end
+
+-- 8-bit signed (MOD) → 8-bit unsigned (WAV) lookup
+local UNSIGNED = {}
+for b = 0, 255 do UNSIGNED[b] = string.char((b + 128) % 256) end
+
+local function toUnsigned(data)
+    local out, n = {}, 0
+    for a = 1, #data, 1024 do  -- chunked: string.byte returns values on the stack
+        local bytes = { string.byte(data, a, math.min(a + 1023, #data)) }
+        for k = 1, #bytes do
+            n = n + 1
+            out[n] = UNSIGNED[bytes[k]]
+        end
+    end
+    return table.concat(out)
+end
+
+-- Write unsigned 8-bit PCM as <name>.wav (Amiga C-2 base: 8363 Hz at period 428)
+local function writeWav(name, pcm)
+    local file = name .. ".wav"
+    local wavData = createWavHeader(8363, 8, 1, #pcm) .. pcm
+    love.filesystem.write(file, wavData, #wavData)
+    return file
+end
+
+-- Collect every (sample, 9xx) pair the song uses, walking the order list
+local function scanSampleOffsets()
+    local used, lastSample, lastParam = {}, {}, {}
+    for o = 1, mod.songLength do
+        local pattern = mod.patterns[mod.patternTable[o]]
+        for row = 1, (pattern and 64 or 0) do
+            for c = 1, mod.numChannels do
+                local note = pattern[row][c]
+                if note.sample > 0 then lastSample[c] = note.sample end
+                if note.effect == 0x9 and note.period > 0 then
+                    if note.effectParam > 0 then lastParam[c] = note.effectParam end
+                    local s, p = lastSample[c], lastParam[c]
+                    if s and p then
+                        used[s] = used[s] or {}
+                        used[s][p] = true
+                    end
+                end
+            end
+        end
+    end
+    return used
+end
+
+function Source.load()
+    pcall(love.audio.setDistanceModel, "none")  -- desktop LÖVE: pan without attenuation
+    sampleFiles, tickAccum = {}, 0
+    if vizRing then Mixer.prepare() end         -- silent mix for the visualisers
+    local offsets = scanSampleOffsets()
+    for i, sample in ipairs(mod.samples) do
+        if sample.length > 0 then
+            local pcm     = toUnsigned(sample.data)
+            local headEnd = sample.hasLoop and sample.loopEnd or sample.length
+            local entry   = { head = writeWav("s" .. i, pcm:sub(1, headEnd)), headEnd = headEnd, offsets = {} }
+            if sample.hasLoop then
+                if sample.loopStart == 0 then
+                    entry.headLoops = true
+                else
+                    entry.loop = writeWav("s" .. i .. "l", pcm:sub(sample.loopStart + 1, sample.loopEnd))
+                end
+            end
+            for p in pairs(offsets[i] or {}) do
+                if p * 256 < headEnd then
+                    entry.offsets[p] = writeWav("s" .. i .. "o" .. p, pcm:sub(p * 256 + 1, headEnd))
+                end
+            end
+            sampleFiles[i] = entry
+        end
+    end
+    for c = 1, mod.numChannels do channelSources[c] = {} end
+end
+
+-- Helper: apply a pan value (-1..+1) to a LÖVE source (desktop LÖVE only).
+-- The source sits on a unit circle in front of the listener: with the distance
+-- model disabled only the direction counts, so (pan, 0, 0) alone would make any
+-- non-zero pan hard left/right.  Wrapped in pcall: LoveDOS has no 3D audio.
+local function applyPan(source, pan)
+    pcall(function()
+        source:setRelative(true)
+        source:setPosition(pan, 0, -math.sqrt(1 - pan * pan))
+    end)
+end
+
+-- Push the channel's output registers to its Source (only what changed)
+local function applySource(ch)
+    local src = ch.src
+    local period = clampPeriod(ch.outPeriod > 0 and ch.outPeriod or 428)
+    if period ~= ch.srcPeriod then
+        src:setPitch(428 / period)
+        ch.srcPeriod = period
+    end
+    if ch.outVolume ~= ch.srcVolume then
+        src:setVolume(ch.outVolume / 64)
+        ch.srcVolume = ch.outVolume
+    end
+    if ch.pan ~= ch.srcPan then
+        applyPan(src, ch.pan)
+        ch.srcPan = ch.pan
+    end
+end
+
+local function startSource(c, file, looping)
+    local ch  = channels[c]
+    local src = channelSources[c][file]
+    if not src then
+        src = love.audio.newSource(file, "static")
+        channelSources[c][file] = src
+    end
+    src:stop()              -- also rewinds
+    src:setLooping(looping)
+    ch.src = src
+    ch.srcPeriod, ch.srcVolume, ch.srcPan = nil, nil, nil
+    applySource(ch)
+    src:play()
+end
+
+function Source.commit(c)
+    local ch = channels[c]
+    if ch.trigSample then
+        local entry = sampleFiles[ch.trigSample]
+        local param = math.floor(ch.trigOffset / 256)
+        if ch.src then ch.src:stop() end
+        ch.src, ch.srcNext = nil, nil
+        if entry then
+            local loopFile = entry.loop or (entry.headLoops and entry.head) or nil
+            if param > 0 and entry.offsets[param] then
+                startSource(c, entry.offsets[param], false)
+                ch.srcNext = loopFile
+            elseif param > 0 and param * 256 >= entry.headEnd then
+                -- Offset past the end: loop part only, or silence (§5.10)
+                if loopFile then startSource(c, loopFile, true) end
+            else
+                startSource(c, entry.head, entry.headLoops or false)
+                ch.srcNext = entry.loop
+            end
+        end
+    end
+    if ch.src then applySource(ch) end
+end
+
+-- Desktop UI: mix the tick silently, only to feed the scope and spectrum
+local shadowRemain = 0
+local function shadowMix()
+    for c = 1, mod.numChannels do Mixer.commit(c) end
+    shadowRemain = shadowRemain + MIX_RATE * 5 / (2 * bpm)
+    local n = math.floor(shadowRemain)
+    shadowRemain = shadowRemain - n
+    while n > 0 do
+        local k = math.min(n, MIX_BUFFER)
+        mixFrames(1, k)
+        vizWrite(k)
+        n = n - k
+    end
+end
+
+function Source.update(dt)
+    tickAccum = tickAccum + dt * (2 * bpm / 5)   -- ticks per second (125 BPM → 50)
+    while tickAccum >= 1 do
+        tickAccum = tickAccum - 1
+        playerTick()
+        for c = 1, mod.numChannels do Source.commit(c) end
+        if vizRing then
+            if onTickHook then onTickHook(vizFrames) end
+            shadowMix()
+        end
+    end
+
+    -- Head finished → continue with the looping part
+    for c = 1, mod.numChannels do
+        local ch = channels[c]
+        if ch.srcNext and ch.src and not ch.src:isPlaying() then
+            local nextFile = ch.srcNext
+            ch.srcNext = nil
+            startSource(c, nextFile, true)
+        end
+    end
+end
+
+function Source.stop()
+    for c = 1, mod.numChannels do
+        local ch = channels[c]
+        if ch.src then ch.src:stop() end
+        ch.src, ch.srcNext = nil, nil
+    end
+end
+
+function Source.level(c)
+    local ch = channels[c]
+    return (ch.src and ch.src:isPlaying()) and ch.outVolume / 64 or 0
+end
+
+Source.flush = Source.stop
+
+-- Sources start right away, so the newest tick is the one being heard
+function Source.position()
+    return vizFrames
+end
+
+
+-- ═══════════════════════════════════════════════════════════════
+--  Shared helpers
+-- ═══════════════════════════════════════════════════════════════
 
 local function periodToNote(period)
     local notes = {"C-", "C#", "D-", "D#", "E-", "F-", "F#", "G-", "G#", "A-", "A#", "B-"}
-    local octave = 0
-    local foundNote = false
-
-    for i, subTable in ipairs(PERIOD_TABLE) do
-        for j, value in ipairs(subTable) do
-            if period >= value then
-                local noteIndex = (j - 1) % 12 + 1
-                octave = math.floor((j - 1) / 12) + (i - 1)
-                return notes[noteIndex] .. tostring(octave)
-            end
+    local row = PERIOD_TABLE[1]
+    for j = 1, 60 do
+        if period >= row[j] then
+            return notes[(j - 1) % 12 + 1] .. tostring(math.floor((j - 1) / 12))
         end
     end
-
     return nil
 end
 
-function love.draw()
+-- Reset all playback state to the start of the song
+local function startSong()
+    for _, sample in ipairs(mod.samples) do
+        sample.finetune = sample.baseFinetune
+    end
+    initializeChannels()
+    ticksPerRow, bpm = 6, 125
+    jumpToOrder, breakToRow, loopToRow, patDelay = nil, nil, nil, 0
+    -- Prime the player: tick starts at SPEED so the first tick plays row 1
+    -- (FMODDOC §3.3)
+    currentPatternIndex = 1
+    currentPattern = mod.patternTable[currentPatternIndex]
+    currentRow = 1
+    currentTick = ticksPerRow
+    songStarted, songEnded = false, false
+    songTime, tickRemain, shadowRemain = 0, 0, 0
+end
+
+-- ═══════════════════════════════════════════════════════════════
+--  LoveDOS screen: the original plain-text display
+-- ═══════════════════════════════════════════════════════════════
+
+local function drawLoveDOS()
     love.graphics.print("MOD Player", 10, 10)
     love.graphics.print("Pattern: " .. currentPattern, 10, 30)
     love.graphics.print("Row: " .. currentRow-1, 10, 50)
-    love.graphics.print("Tick: " .. currentTick, 10, 70)
-    
+    love.graphics.print(songEnded and "Song ended - Space restarts" or ("Tick: " .. currentTick), 10, 70)
+
+    local pattern = mod.patterns[currentPattern]
+    local rowData = pattern and pattern[currentRow]
+
     -- Draw a simple visualization
     love.graphics.setColor(255, 255, 255)
     for i = 1, mod.numChannels do
-        local volume = channels[i].source and channels[i].source.getVolume and channels[i].source:getVolume() or 0
-        local height = volume * 100
+        local height = backend.level(i) * 100
         love.graphics.rectangle("fill", (i-1) * 30 + 10, 110, 20, height)
 
-		local note = mod.patterns[currentPattern][currentRow][i]
-		local noteStr = periodToNote(note.period)
-		if noteStr == nil then
-			noteStr = "---"
-		end
+		local note = rowData and rowData[i]
+		local noteStr = note and periodToNote(note.period) or "---"
 		love.graphics.print(noteStr, (i-1) * 30 + 10, 90)
     end
-
-	-- check for NON-LoveDOS
-	if love.graphics.isActive and love.graphics.isActive() then
-		-- Display pattern grid
-		local gridX = 250
-		local gridY = 25
-		local cellWidth = 100
-		local cellHeight = 20
-		local visibleRows = 28  -- Number of rows to display at once
-
-		for row = 0, visibleRows - 1 do
-			local actualRow = (currentRow-1 + row) % 64
-			local y = gridY + row * cellHeight
-
-			-- Highlight current row
-			if row == 0 then
-				love.graphics.setColor(0.2, 0.2, 0.8, 0.5)
-				love.graphics.rectangle("fill", gridX, y, cellWidth * mod.numChannels, cellHeight)
-			end
-
-			love.graphics.setColor(1, 1, 1)
-			love.graphics.print(string.format("%02d", actualRow), gridX - 30, y)
-
-			for channel = 1, mod.numChannels do
-				local x = gridX + (channel - 1) * cellWidth
-				love.graphics.rectangle("line", x, y, cellWidth, cellHeight)
-
-				if mod.patterns[currentPattern] then
-					local note = mod.patterns[currentPattern][actualRow+1][channel]
-					local noteStr = periodToNote(note.period)
-
-					local noteSample = ".."
-					local noteEffect = "..."
-					local noteEffectParam = ""
-
-					
-					if noteStr == nil then
-						noteStr = "---"
-					end
-					
-					if note.sample ~= nil and tonumber(note.sample) ~= 0 then
-						if tonumber(note.sample) < 9 then
-							noteSample = "0" .. note.sample
-						else
-							noteSample = string.format("%02X", note.sample )
-						end
-					end
-					if tonumber(note.sample) == 0 then
-						noteSample = ".."
-					end
-
-					if note.effect ~= nil and tonumber(note.effect) ~= 0 then
-						noteEffect = string.format("%01X", note.effect )
-					end
-					if tonumber(note.effect) == 0 then
-						noteEffect = "..."
-					end
-					if note.effectParam ~= nil and tonumber(note.effectParam) ~= 0 then
-						noteEffectParam = string.format("%02X", note.effectParam )
-					end
-					if tonumber(note.effectParam) == 0 then
-						noteEffectParam = ""
-					end
-
-					love.graphics.print(noteStr .. " " .. noteSample .. " " .. noteEffect .. noteEffectParam, x + 5, y + 2)
-				end
-			end
-		end
-
-		-- Display channel numbers
-		for channel = 1, mod.numChannels do
-			local x = gridX + (channel - 1) * cellWidth
-			love.graphics.print(channel, x + cellWidth / 2 - 5, gridY - 20)
-		end
-	end
 end
 
-local function togglePlay()
+local function togglePlayLoveDOS()
+    if songEnded then
+        -- Song stopped by F00: Space plays it again from the start
+        startSong()
+        play = true
+        return
+    end
     play = not play
     if not play then
-        love.audio.stop()
+        backend.stop()
     end
+end
+
+-- ═══════════════════════════════════════════════════════════════
+--  Desktop front end: retro UI (ui.lua), file browser, playlist
+-- ═══════════════════════════════════════════════════════════════
+
+local ui, fsb  -- desktop-only modules, loaded in love.load
+
+-- Everything the UI shows
+local app = {
+    mod         = nil,
+    playing     = false,
+    scanlines   = true,
+    interpolate = false,
+    mixer       = USE_SOFTWARE_LOOP,
+    folder      = nil,   -- folder of the current playlist
+    tracks      = {},    -- MOD files in that folder (full paths)
+    track       = 0,     -- index into tracks
+    songName    = "",
+    message     = nil,
+    noteName    = periodToNote,
+    browser     = { open = false, dir = nil, title = "", items = {}, sel = 1, scroll = 0 },
+}
+local messageTimer = 0
+
+local function say(msg)
+    app.message, messageTimer = msg, 3
+end
+
+-- Display state after a tick, stamped with the output frame it is heard at
+local function snapshot(pos)
+    local s = {
+        pos = pos, order = currentPatternIndex, pattern = currentPattern, row = currentRow,
+        speed = ticksPerRow, bpm = bpm, time = songTime, ended = songEnded,
+        hit = {}, vol = {}, instr = {}, active = {},
+    }
+    for c = 1, mod.numChannels do
+        local ch = channels[c]
+        s.hit[c]    = (ch.trigSample or 0) > 0
+        s.vol[c]    = ch.outVolume
+        s.instr[c]  = ch.lastSample
+        s.active[c] = ch.vActive or false
+    end
+    return s
+end
+
+-- ── Settings (save directory) ────────────────────────────────────
+local SETTINGS = "settings.txt"
+
+local function loadSettings()
+    local s = {}
+    local data = love.filesystem.read(SETTINGS)
+    if data then
+        for k, v in data:gmatch("([%w_]+)=([^\n]*)") do s[k] = v end
+    end
+    return s
+end
+
+local function saveSettings()
+    love.filesystem.write(SETTINGS, table.concat({
+        "folder=" .. (app.folder or ""),
+        "track=" .. (app.tracks[app.track] and fsb.basename(app.tracks[app.track]) or ""),
+        "scanlines=" .. tostring(app.scanlines),
+        "interpolate=" .. tostring(app.interpolate),
+    }, "\n") .. "\n")
+end
+
+-- ── Playback ─────────────────────────────────────────────────────
+-- "song.mod" and the Amiga style "mod.song"
+local function isMOD(name)
+    name = name:lower()
+    return name:match("%.mod$") ~= nil or name:match("^mod%.") ~= nil
+end
+
+local function setPlaying(on)
+    play, app.playing = on, on
+    if not on and backend then backend.stop() end
+end
+
+-- Back to the start of the song, dropping audio that is still queued
+local function restart()
+    backend.flush()
+    startSong()
+    ui.reset(backend.position(), snapshot(backend.position()))
+end
+
+local function playSongData(data, name)
+    local ok, newMod = pcall(parseMOD, data)
+    if not ok then say(name .. ": " .. tostring(newMod)); return false end
+    if backend then backend.stop() end
+    mod = newMod
+    startSong()
+    backend = USE_SOFTWARE_LOOP and Mixer or Source
+    backend.load()
+    app.mod, app.songName = mod, name
+    ui.reset(backend.position(), snapshot(backend.position()))
+    return true
+end
+
+local function scanFolder(dir)
+    local dirs, files = fsb.list(dir)
+    if not dirs then return nil end
+    local tracks = {}
+    for _, f in ipairs(files) do
+        if isMOD(f) then tracks[#tracks + 1] = fsb.join(dir, f) end
+    end
+    return tracks
+end
+
+local function playTrack(i)
+    local path = app.tracks[i]
+    if not path then return false end
+    local data, err = fsb.read(path)
+    if not data then say(err); return false end
+    if not playSongData(data, fsb.basename(path)) then return false end
+    app.track = i
+    saveSettings()
+    return true
+end
+
+local function stepTrack(d)
+    local n = #app.tracks
+    if n == 0 then return end
+    for k = 1, n do                       -- skip files that fail to load
+        if playTrack((app.track - 1 + d * k) % n + 1) then return end
+    end
+end
+
+-- Use `dir` as the playlist folder and play `file` (or its first song)
+local function openFolder(dir, file)
+    local tracks = scanFolder(dir)
+    if not tracks then say("Cannot open " .. dir); return false end
+    if #tracks == 0 then say("No MOD files in " .. fsb.basename(dir)); return false end
+    app.folder, app.tracks = dir, tracks
+    local idx = 1
+    for i, t in ipairs(tracks) do
+        if file and fsb.basename(t):lower() == file:lower() then idx = i end
+    end
+    return playTrack(idx)
+end
+
+-- ── File browser ─────────────────────────────────────────────────
+local browser = app.browser
+
+local function browse(dir)
+    local items = {}
+    if dir == nil then                    -- top level: drive list
+        for _, d in ipairs(fsb.drives()) do items[#items + 1] = { kind = "drive", name = d, path = d } end
+        browser.title = "DRIVES"
+    else
+        local dirs, files = fsb.list(dir)
+        if not dirs then say("Cannot open " .. dir); return end
+        if fsb.parent(dir) or fsb.isWindows then items[1] = { kind = "up" } end
+        for _, d in ipairs(dirs) do items[#items + 1] = { kind = "dir", name = d, path = fsb.join(dir, d) } end
+        for _, f in ipairs(files) do
+            if isMOD(f) then items[#items + 1] = { kind = "file", name = f, path = fsb.join(dir, f) } end
+        end
+        browser.title = dir
+    end
+    local from = browser.dir
+    browser.dir, browser.items, browser.sel, browser.scroll = dir, items, 1, 0
+    -- Coming back up: select the folder we came from; else the current song.
+    for i, it in ipairs(items) do
+        if (from and it.path == from) or (it.kind == "file" and it.path == app.tracks[app.track]) then
+            browser.sel = i
+        end
+    end
+    browser.scroll = math.max(0, browser.sel - ui.browserRows())
+end
+
+local function moveSel(d)
+    local n = #browser.items
+    if n == 0 then return end
+    browser.sel = math.max(1, math.min(n, browser.sel + d))
+    local rows = ui.browserRows()
+    if browser.sel <= browser.scroll then browser.scroll = browser.sel - 1 end
+    if browser.sel > browser.scroll + rows then browser.scroll = browser.sel - rows end
+end
+
+local function activate()
+    local it = browser.items[browser.sel]
+    if not it then return end
+    if it.kind == "up" then browse(fsb.parent(browser.dir))
+    elseif it.kind == "dir" or it.kind == "drive" then browse(it.path)
+    elseif openFolder(browser.dir, it.name) then
+        browser.open = false
+        setPlaying(true)
+    end
+end
+
+local function toggleBrowser()
+    browser.open = not browser.open
+    if browser.open then browse(app.folder or fsb.gameFolder()) end
+end
+
+local function keypressedDesktop(key)
+    if key == "f11" or (key == "return" and love.keyboard.isDown("lalt", "ralt")) then
+        love.window.setFullscreen(not love.window.getFullscreen(), "desktop")
+        ui.resize(love.graphics.getDimensions())
+        return
+    end
+
+    if browser.open then
+        if key == "escape" or key == "tab" then browser.open = false
+        elseif key == "up" then moveSel(-1)
+        elseif key == "down" then moveSel(1)
+        elseif key == "pageup" then moveSel(-ui.browserRows())
+        elseif key == "pagedown" then moveSel(ui.browserRows())
+        elseif key == "home" then moveSel(-#browser.items)
+        elseif key == "end" then moveSel(#browser.items)
+        elseif key == "return" or key == "kpenter" or key == "right" then activate()
+        elseif key == "backspace" or key == "left" then
+            if browser.dir then browse(fsb.parent(browser.dir)) end
+        end
+        return
+    end
+
+    if key == "escape" then
+        love.event.quit()
+    elseif key == "tab" or key == "b" then
+        toggleBrowser()
+    elseif not mod then
+        return
+    elseif key == "space" then
+        if songEnded then
+            restart()
+            setPlaying(true)
+        else
+            setPlaying(not play)
+        end
+    elseif key == "right" then stepTrack(1)
+    elseif key == "left" then stepTrack(-1)
+    elseif key == "r" then restart()
+    elseif key == "i" then
+        interpolate = not interpolate
+        app.interpolate = interpolate
+        if USE_SOFTWARE_LOOP then
+            say(interpolate and "Linear interpolation on" or "Interpolation off (raw like Paula)")
+        else
+            say("Interpolation only affects the mixer (USE_SOFTWARE_LOOP = true)")
+        end
+        saveSettings()
+    elseif key == "s" then
+        app.scanlines = not app.scanlines
+        saveSettings()
+    end
+end
+
+local function loadDesktop(arg)
+    local ffi = require("ffi")
+    ui  = require("ui")
+    fsb = require("fsbrowse")
+    vizRing = ffi.new("int16_t[?]", VIZ_RING)
+    onTickHook = function(pos) ui.pushTick(snapshot(pos)) end
+    ui.load(vizRing, VIZ_RING, MIX_RATE)
+    ui.reset(0, nil)
+
+    local s = loadSettings()
+    app.scanlines   = s.scanlines ~= "false"
+    app.interpolate = (s.interpolate == "true") or MIX_INTERPOLATE
+    interpolate     = app.interpolate
+    setPlaying(false)
+
+    -- A file on the command line, else the last folder, else DEFAULT_MOD
+    local game = fsb.gameFolder()
+    local file = type(arg) == "table" and type(arg[1]) == "string" and arg[1]
+    local opened = false
+    if file and isMOD(fsb.basename(file)) then
+        local path = fsb.normalize(file)
+        if not (path:match("^%a:") or path:sub(1, 1) == "/") then path = fsb.join(game, path) end
+        opened = openFolder(fsb.parent(path), fsb.basename(path))
+    end
+    if not opened and s.folder and s.folder ~= "" then
+        opened = openFolder(s.folder, s.track)
+    end
+    if not opened then
+        local dir = DEFAULT_MOD:match("^(.*)/[^/]+$")
+        opened = openFolder(dir and fsb.join(game, fsb.normalize(dir)) or game, fsb.basename(DEFAULT_MOD))
+    end
+    if not opened then
+        -- No MOD files in MUSIC/ (e.g. a fresh clone): play the demo song.
+        -- Read through love.filesystem, so it is found inside a .love file too.
+        local data = love.filesystem.read(DEMO_MOD)
+        opened = data ~= nil and playSongData(data, DEMO_MOD)
+        app.message = nil
+        if opened then
+            say("No MOD in MUSIC/ - playing the demo song. TAB: browse")
+        else
+            toggleBrowser()
+            say("Pick a folder with MOD files")
+        end
+    end
+    if opened then setPlaying(true) end
+end
+
+-- ═══════════════════════════════════════════════════════════════
+--  LÖVE callbacks
+-- ═══════════════════════════════════════════════════════════════
+
+-- tick driver: love.update
+function love.update(dt)
+    if play and backend then backend.update(dt) end
+    if ui then
+        ui.update(dt, backend and backend.position() or 0)
+        if messageTimer > 0 then
+            messageTimer = messageTimer - dt
+            if messageTimer <= 0 then app.message = nil end
+        end
+    end
+end
+
+function love.draw()
+    if ui then ui.draw(app) else drawLoveDOS() end
 end
 
 function love.keypressed(key)
+    if ui then return keypressedDesktop(key) end
     if key == "escape" then
         love.event.quit()
     end
 	if key == "space" then
-        togglePlay()
+        togglePlayLoveDOS()
     end
 end
 
+function love.resize(w, h)
+    if ui then ui.resize(w, h) end
+end
+
+function love.wheelmoved(_, y)
+    if ui and browser.open then moveSel(-y * 3) end
+end
+
+local lastClick, lastIndex = 0, nil
+
+function love.mousepressed(x, y, button)
+    if not ui or not browser.open or button ~= 1 then return end
+    local i = ui.browserHit(browser, ui.toCanvas(x, y))
+    if not i then return end
+    local now = love.timer.getTime()
+    browser.sel = i
+    if lastIndex == i and now - lastClick < 0.4 then activate() end
+    lastClick, lastIndex = now, i
+end
+
+-- Drop a folder: play it.  Drop a MOD file: play its folder from that file.
+function love.directorydropped(path)
+    path = fsb.normalize(path)
+    if openFolder(path) then
+        browser.open = false
+        setPlaying(true)
+    else
+        browser.open = true
+        browse(path)
+    end
+end
+
+function love.filedropped(file)
+    local path = fsb.normalize(file:getFilename())
+    if not isMOD(fsb.basename(path)) then say("Not a MOD file"); return end
+    local dir = fsb.parent(path)
+    if dir and openFolder(dir, fsb.basename(path)) then
+        browser.open = false
+        setPlaying(true)
+    end
+end
+
+function love.quit()
+    if ui then saveSettings() end
+end
+
 -- LÖVE-DOS callback functions
-function love.load()
-	--love.window.setMode(1024, 768, {resizable = true, vsync = true})
-    mod = loadMOD("MUSIC/viraxor_-_10_tons.mod") -- Load your MOD file
-    initializeChannels()
-    loadSamples()
-    -- Prime the player: set initial pattern and play row 1 immediately
-    currentPatternIndex = 1
-    currentPattern = mod.patternTable[currentPatternIndex]
-    currentRow = 1
-    currentTick = ticksPerRow  -- will fire on first update
+function love.load(arg)
+    if not IS_LOVEDOS then return loadDesktop(arg) end
+    local file = DEFAULT_MOD
+    if type(arg) == "table" and type(arg[1]) == "string" and arg[1]:lower():match("%.mod$") then
+        file = arg[1]
+    end
+    local ok, data = pcall(love.filesystem.read, file)
+    if not (ok and data) then
+        print("Info: " .. file .. " not found - playing " .. DEMO_MOD)
+        data = love.filesystem.read(DEMO_MOD)
+    end
+    mod = parseMOD(data) -- Load your MOD file
+    startSong()
+    backend = USE_SOFTWARE_LOOP and Mixer or Source
+    backend.load()
 end
