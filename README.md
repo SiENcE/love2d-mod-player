@@ -2,7 +2,8 @@
 
 ![MOD Player](docs/Recording.gif)
 
-# love2d-mod-player
+## Quick start
+
 A MOD player made in love2d (lua) without additional dependencies
 
 Runs on [LÖVE](https://love2d.org) 11+ and on [LoveDOS](https://github.com/rxi/lovedos).
@@ -10,7 +11,7 @@ The player core follows the FireLight MOD tutorial in [`doc/FMODDOC.TXT`](doc/FM
 
 ```
 love .                      # plays the last song, or DEFAULT_MOD (set at the top of main.lua)
-love . MUSIC/slope.mod      # play another file (LÖVE 11)
+love . MUSIC/demo.mod      # play another file (LÖVE 11)
 ```
 
 Put your own MOD files in `MUSIC/`. That folder is not in git, because we have no rights to redistribute other people's modules. If no MOD is found (e.g. right after cloning), the player plays `demo.mod`. It's an original song made for this player: the samples were synthesised and the patterns written in code.
