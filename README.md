@@ -1,6 +1,6 @@
 # MOD PLAYER by [SiENcE.github.io](https://SiENcE.github.io)
 
-![MOD Player](docs/Recording.gif)
+![MOD Player](doc/Recording.gif)
 
 ## Quick start
 
